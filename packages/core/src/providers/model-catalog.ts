@@ -62,6 +62,16 @@ type CatalogProviderModelOverride = ProviderCatalogModelsResult & {
 };
 
 const presetCatalogModelOverrides: Record<string, CatalogProviderModelOverride> = {
+  "minimax-global": {
+    models: ["MiniMax-M3.1-Flash", "MiniMax-M3"],
+    provider: "minimax",
+    providerName: "MiniMax (Global)"
+  },
+  "minimax-cn": {
+    models: ["MiniMax-M3.1-Flash", "MiniMax-M3"],
+    provider: "minimax-cn",
+    providerName: "MiniMax (China)"
+  },
   "kimi-coding": {
     modelDisplayNames: {
       "kimi-for-coding": "K2.7 Code"

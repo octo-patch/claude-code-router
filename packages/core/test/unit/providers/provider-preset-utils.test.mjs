@@ -106,8 +106,8 @@ test("provider identity lookup prefers exact Kimi regional names over shared ali
 });
 
 test("MiniMax presets expose current models and regional endpoints", () => {
-  assert.deepEqual(minimaxGlobalProviderPreset.defaultModels, ["MiniMax-M3", "MiniMax-M2.7"]);
-  assert.deepEqual(minimaxChinaProviderPreset.defaultModels, ["MiniMax-M3", "MiniMax-M2.7"]);
+  assert.deepEqual(minimaxGlobalProviderPreset.defaultModels, ["MiniMax-M3.1-Flash", "MiniMax-M3"]);
+  assert.deepEqual(minimaxChinaProviderPreset.defaultModels, ["MiniMax-M3.1-Flash", "MiniMax-M3"]);
   assert.deepEqual(minimaxGlobalProviderPreset.endpoints.map((endpoint) => endpoint.baseUrl), [
     "https://api.minimax.io/v1",
     "https://api.minimax.io/anthropic"
