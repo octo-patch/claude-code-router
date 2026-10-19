@@ -93,11 +93,15 @@ export type AddProviderDraft = {
   accountMode: ProviderAccountDraftMode;
   accountRefreshIntervalMs: string;
   apiKey: string;
+  autoFetchModels: boolean;
+  autoFetchKnownModels: string[];
   baseUrl: string;
   capabilities: GatewayProviderCapability[];
   catalogModelMetadata?: Record<string, ProviderModelMetadata>;
   credentialMode: "apiKey" | "pool";
   credentials: ProviderCredentialDraft[];
+  extraBodyText: string;
+  extraHeadersText: string;
   icon: string;
   modelDescriptions?: Record<string, string>;
   modelDisplayNames?: Record<string, string>;
@@ -180,6 +184,7 @@ export type AddProfileDraft = {
   botHandoffPhoneBluetoothTargets: string;
   botHandoffPhoneWifiTargets: string;
   botPlatform: string;
+  claudeSettingsText: string;
   configFile: string;
   envRows: KeyValueDraftRow[];
   fableModel: string;
@@ -316,7 +321,9 @@ export type VirtualModelDraft = {
   fixedModel: string;
   id: string;
   includeInGatewayModels: boolean;
+  imageGenerationFallbackModels: string[];
   imageGenerationModel: string;
+  imageGenerationRetryCount: string;
   instructionsAppend: string;
   instructionsPrepend: string;
   instructionsReplace: string;
@@ -332,8 +339,12 @@ export type VirtualModelDraft = {
   toolsText: string;
   customMcpServer: McpServerDraft;
   customToolName: string;
+  visionFallbackModels: string[];
   visionModel: string;
+  visionRetryCount: string;
+  videoGenerationFallbackModels: string[];
   videoGenerationModel: string;
+  videoGenerationRetryCount: string;
   webSearchEnvRows: KeyValueDraftRow[];
   webSearchProvider: VirtualModelFusionWebSearchProvider;
   executionMode: VirtualModelExecutionMode;

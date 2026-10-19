@@ -22,17 +22,16 @@ If the main need is local Agent multi-instance, tray, or desktop app launching, 
 host 3458 -> container Nginx 8080
                          |-> static management UI
                          |-> management RPC: 127.0.0.1:3459
-                         |-> model gateway:  127.0.0.1:3456
-                         `-> core runtime:   127.0.0.1:3457
+                         `-> model gateway:  127.0.0.1:3456
 ```
 
-Only the Nginx container port `8080` should be published. `3459`, `3456`, and `3457` are container-internal implementation ports; do not map them to the host individually.
+Only the Nginx container port `8080` should be published. `3459` and `3456` are container-internal implementation ports; do not map them to the host individually.
 
 Nginx exposes:
 
 | Path | Purpose |
 | --- | --- |
-| `/`, `/pages/home/index.html` | Management UI. The root path redirects to a page URL containing the management token. |
+| `/`, `/pages/home/index.html` | Management UI. The root path redirects to the page and keeps a `ccr_web_token` query parameter if the request has one. Nginx never adds the token. |
 | `/api/ccr/rpc` | Management RPC, protected by the management token. |
 | `/health` | Model gateway health; container or UI status is not reflected here. |
 | `/v1/*`, `/v1beta/*`, `/messages`, `/chat/completions`, `/responses`, `/interactions`, `/mcp/*` | Model and MCP gateway endpoints. |
@@ -42,18 +41,20 @@ Nginx exposes:
 From the repository root:
 
 ```sh
-docker compose up -d --build
+npm run docker:compose:up
 docker compose logs -f ccr
 ```
 
-Open <http://127.0.0.1:3458>. On a fresh volume the management UI is available immediately; the model gateway only starts working after a provider and a model have been added.
+Open the management URL that the entrypoint prints in the container log, `http://127.0.0.1:3458/?ccr_web_token=<token>`. It is only printed when the token was generated; if you set `CCR_WEB_AUTH_TOKEN` yourself, add it to the URL. On a fresh volume the management UI is available immediately; the model gateway only starts working after a provider and a model have been added.
+
+The npm Compose script prepares a local `../../next-ai/gateway` checkout before building so the image uses that plugin-capable ai-gateway runtime. If you run `docker compose up -d --build` directly, run `npm run docker:prepare-gateway` first. `npm run docker:build` performs the same preparation automatically.
 
 Complete the first-time configuration in this order:
 
 1. Add a provider and at least one model.
 2. Create a CCR client key on the **API Keys** page.
 3. Start the gateway on the **Server** page.
-4. Request `/health` and confirm it returns `200` with a running status.
+4. Request `/health` and confirm it returns `200` with status `ok`.
 5. Point the client Base URL at `http://127.0.0.1:3458` and use the CCR client key you just created.
 
 Stopping or removing the container does not delete the named volume:
@@ -83,7 +84,7 @@ The left side of the port mapping is the host address and port; the right side i
 Without Compose:
 
 ```sh
-docker build -t claude-code-router:local .
+npm run docker:build
 docker run -d \
   --name claude-code-router \
   --restart unless-stopped \
@@ -93,7 +94,7 @@ docker run -d \
   claude-code-router:local
 ```
 
-The repository also provides `npm run docker:build` and `npm run docker:run`. The latter uses `3458` and `ccr-data`, but the container runs with `--rm` and has no fixed name or restart policy, so it is better suited to temporary verification.
+The repository also provides `npm run docker:run`. It uses `3458` and `ccr-data`, but the container runs with `--rm` and has no fixed name or restart policy, so it is better suited to temporary verification.
 
 ## Do not mix up the three credentials
 
@@ -103,7 +104,7 @@ The repository also provides `npm run docker:build` and `npm run docker:run`. Th
 | CCR client API key | Model gateway request authentication | **API Keys** page in the UI |
 | Upstream provider credential | CCR calling model providers | **Providers** page in the UI |
 
-Without `CCR_WEB_AUTH_TOKEN`, the entrypoint generates a new random token on every container start. Opening the root address still works because Nginx redirects to a URL containing the current token; but persistent and remote deployments should pin a sufficiently long, strong token.
+Without `CCR_WEB_AUTH_TOKEN`, the entrypoint generates a new random token on every container start and prints the management URL once to the container log. Nginx never sends the token to a client: opening the root address without a token loads the page, but every management call fails with `401` until the token is supplied in the URL. The page keeps it for the browser tab session. Persistent and remote deployments should pin a sufficiently long, strong token.
 
 Do not write the token directly into shell history. Create an environment file that stays out of version control:
 
@@ -217,7 +218,6 @@ A typical deployment only needs `CCR_WEB_AUTH_TOKEN`, `CCR_PUBLIC_BASE_URL`, and
 | `CCR_WEB_PORT` | `3459` | Management service port inside the container. |
 | `CCR_GATEWAY_HOST` | `127.0.0.1` | Model gateway listen address inside the container. |
 | `CCR_GATEWAY_PORT` | `3456` | Model gateway port inside the container that Nginx proxies to. |
-| `CCR_GATEWAY_CORE_PORT` | `3457` | Core Gateway Runtime port inside the container. |
 | `CCR_NO_GATEWAY` | `0` | When set to `1`, `true`, or `yes`, only the management UI runs during startup. |
 | `CCR_DOCKER_INIT_CONFIG` | `1` | Set to `0` to disable the first-boot minimal `config.json` bootstrap. |
 | `CCR_DOCKER_SYNC_PUBLIC_ENDPOINT` | `1` | Set to `0` to stop synchronizing existing JSON / SQLite listener and public address fields at startup. |
@@ -258,7 +258,7 @@ docker compose config
 
 ### The root address returns `302`
 
-This is expected behavior. Nginx is redirecting the root address to a page URL containing the URL-encoded management token.
+This is expected behavior. Nginx redirects the root address to the management page and keeps the query string, so a `ccr_web_token` you supply survives. It does not add a token.
 
 ### `/health` returns `502`
 
@@ -266,7 +266,7 @@ It checks the model gateway, not Nginx or the UI. A fresh volume without a confi
 
 ### The UI returns `401` after a token change
 
-Reopen the bare root address so Nginx generates a URL containing the new token; close tabs and bookmarks that still use the old `ccr_web_token`.
+Reopen `/?ccr_web_token=<token>` with the current token (for a generated token, read it from `docker compose logs ccr`); close tabs and bookmarks that still use the old `ccr_web_token`.
 
 ### Clients still use the old port or domain
 

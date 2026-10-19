@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,6 +14,114 @@ const workerFile = [
   path.resolve(__dirname, "../../runtime/request-log-worker.js")
 ].find(existsSync);
 assert.ok(workerFile, "compiled request-log-worker.js must exist");
+
+// Reproduce #1807 with V8's actual heap-limit termination, not a thrown error.
+// The poison allocation is confined to a worker with a 16 MB old-space limit.
+test("#1807 real worker OOM isolates poison and drains the healthy backlog", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-real-oom-"));
+  const fixture = path.join(dir, "oom.cjs");
+  writeFileSync(fixture, `
+    const { parentPort } = require('node:worker_threads');
+    parentPort.on('message', message => {
+      if (message.type === 'batch') {
+        if (message.commands.some(c => c.input.requestId === 'poison')) {
+          const retained = [];
+          while (true) retained.push(new Array(131072).fill(42));
+        }
+        parentPort.postMessage({ type: 'ack', batchId: message.batchId });
+      } else {
+        parentPort.postMessage({ type: 'response', requestId: message.requestId });
+        if (message.method === 'shutdown') parentPort.close();
+      }
+    });
+    parentPort.postMessage({ type: 'ready' });
+  `);
+  const runtime = createRequestLogRuntime({ dbFile: path.join(dir, "logs.sqlite"), workerFile: fixture, writerHeapLimitMb: 16 });
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    runtime.enqueueRecord(createRecord("poison"));
+    for (let i = 0; i < 100; i++) assert.equal(runtime.enqueueRecord(createRecord(`healthy-${i}`)).accepted, true);
+    assert.equal((await runtime.flush({ timeoutMs: 15000 })).timedOut, false);
+    assert.equal(runtime.metrics().dropped, 1);
+    assert.equal(runtime.metrics().committed, 100);
+    assert.equal(runtime.metrics().writerRestarts, 3);
+    assert.equal(runtime.metrics().queueBytes, 0);
+    assert.match(warnings.join("\n"), /memory|heap/i);
+  } finally {
+    console.warn = warn;
+    await runtime.close({ timeoutMs: 1000 });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1807 query OOM rejects the request and the next query starts a bounded worker", { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-query-oom-"));
+  const fixture = path.join(dir, "query.cjs");
+  writeFileSync(fixture, `
+    const { parentPort, workerData, resourceLimits } = require('node:worker_threads');
+    const fs = require('node:fs');
+    if (workerData.mode === 'query') {
+      fs.appendFileSync(workerData.dbFile + '.starts', 'query\\n');
+      if (resourceLimits.maxOldGenerationSizeMb !== 16) throw new Error('missing query heap limit');
+    }
+    parentPort.on('message', message => {
+      if (message.method === 'list' && !fs.existsSync(workerData.dbFile + '.poisoned')) {
+        fs.writeFileSync(workerData.dbFile + '.poisoned', '1');
+        const retained = [];
+        while (true) retained.push(new Array(131072).fill(42));
+      }
+      parentPort.postMessage({ type: 'response', requestId: message.requestId, result: { items: [] } });
+      if (message.method === 'shutdown') parentPort.close();
+    });
+    parentPort.postMessage({ type: 'ready' });
+  `);
+  const dbFile = path.join(dir, "logs.sqlite");
+  const runtime = createRequestLogRuntime({ dbFile, workerFile: fixture, queryHeapLimitMb: 16 });
+  try {
+    await assert.rejects(runtime.list({}), { code: "ERR_WORKER_OUT_OF_MEMORY" });
+    const pages = await Promise.all([runtime.list({}), runtime.list({})]);
+    assert.deepEqual(pages.map(page => page.items), [[], []]);
+    assert.equal(readFileSync(`${dbFile}.starts`, "utf8"), "query\nquery\n", "concurrent queries must share one replacement worker");
+  } finally {
+    await runtime.close({ timeoutMs: 1000 });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1807 worker crashes have bounded retries and do not block healthy records", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-writer-crash-"));
+  const crashingWorker = path.join(dir, "worker.cjs");
+  writeFileSync(crashingWorker, `
+    const { parentPort, resourceLimits } = require('node:worker_threads');
+    if (resourceLimits.maxOldGenerationSizeMb !== 64) throw new Error('missing heap limit');
+    parentPort.on('message', (message) => {
+      if (message.type === 'batch') {
+        if (message.commands.some(c => c.input.requestId === 'poison')) throw new Error('simulated worker OOM');
+        parentPort.postMessage({ type: 'ack', batchId: message.batchId });
+      } else if (message.type === 'request') {
+        parentPort.postMessage({ type: 'response', requestId: message.requestId });
+        if (message.method === 'shutdown') parentPort.close();
+      }
+    });
+    parentPort.postMessage({ type: 'ready' });
+  `);
+  const runtime = createRequestLogRuntime({ dbFile: path.join(dir, "logs.sqlite"), workerFile: crashingWorker, writerHeapLimitMb: 64 });
+  try {
+    runtime.enqueueRecord(createRecord("poison"));
+    runtime.enqueueRecord(createRecord("healthy"));
+    const result = await runtime.flush({ timeoutMs: 10000 });
+    assert.equal(result.timedOut, false);
+    assert.equal(runtime.metrics().dropped, 1);
+    assert.equal(runtime.metrics().committed, 1);
+    assert.equal(runtime.metrics().writerRestarts, 3);
+    assert.equal(runtime.metrics().queueBytes, 0);
+  } finally {
+    await runtime.close({ timeoutMs: 1000 });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("RequestLogRuntime writes through a worker and reads through the query worker", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-runtime-test-"));
@@ -56,6 +164,50 @@ test("RequestLogRuntime merges a raw trace update that arrives before its reques
     assert.equal(page.items[0].model, "trace-model");
     assert.equal(page.items[0].provider, "trace-provider");
     assert.equal(page.items[0].statusCode, 429);
+  } finally {
+    await runtime.close({ timeoutMs: 5_000 });
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
+test("RequestLogRuntime creates a standalone record from single-service raw trace", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-runtime-standalone-test-"));
+  const runtime = createRuntime(dir);
+  const completedAt = new Date().toISOString();
+  const startedAt = new Date(Date.parse(completedAt) - 1234).toISOString();
+  try {
+    const result = runtime.enqueueRawTrace({
+      allowStandaloneRecord: true,
+      bodyCapturePolicy: "all",
+      completedAt,
+      deferOutcomeUntilRecord: true,
+      durationMs: 1234,
+      method: "POST",
+      model: "standalone-model",
+      path: "/v1/messages",
+      provider: "standalone-provider",
+      requestBodyText: JSON.stringify({ model: "standalone-model" }),
+      requestHeaders: { "content-type": "application/json", "user-agent": "openai-codex test" },
+      requestId: "standalone-raw-trace",
+      responseBodyText: JSON.stringify({ usage: { input_tokens: 3, output_tokens: 4 } }),
+      responseHeaders: { "content-type": "application/json" },
+      startedAt,
+      statusCode: 200,
+      url: "http://127.0.0.1:3456/v1/messages"
+    });
+    assert.deepEqual(result, { accepted: true, degraded: false });
+    await runtime.flush({ timeoutMs: 10_000 });
+
+    const page = await runtime.list({ pageSize: 25 });
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].requestId, "standalone-raw-trace");
+    assert.equal(page.items[0].model, "standalone-model");
+    assert.equal(page.items[0].provider, "standalone-provider");
+    assert.equal(page.items[0].client, "Codex");
+    assert.equal(page.items[0].createdAt, startedAt);
+    assert.equal(page.items[0].completedAt, completedAt);
+    assert.equal(page.items[0].durationMs, 1234);
+    assert.equal(page.items[0].totalTokens, 7);
   } finally {
     await runtime.close({ timeoutMs: 5_000 });
     rmSync(dir, { force: true, recursive: true });
@@ -278,6 +430,50 @@ test("RequestLogStore applies same-batch raw trace updates in sequence order", a
   }
 });
 
+test("RequestLogStore preserves aggregate response bodies when raw trace streams arrive later", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-aggregate-response-test-"));
+  const store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
+  try {
+    await store.writeBatch([
+      {
+        eventId: "aggregate-response-event",
+        input: {
+          ...createRecord("aggregate-response"),
+          responseBodyText: JSON.stringify({
+            content: [{ text: "aggregated assistant answer", type: "text" }],
+            model: "worker-model"
+          }),
+          responseHeaders: { "content-type": "application/json" }
+        },
+        kind: "record",
+        sequence: 1
+      },
+      {
+        input: {
+          isStream: true,
+          requestId: "aggregate-response",
+          responseBodyContentType: "text/event-stream",
+          responseBodyText: "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"stream wire data\"}}\n\n",
+          responseHeaders: { "content-type": "text/event-stream" },
+          statusCode: 200
+        },
+        kind: "raw-trace-update",
+        sequence: 2
+      }
+    ]);
+
+    const page = await store.list({ pageSize: 25 });
+    const detail = await store.getDetail({ id: page.items[0].id });
+    assert.match(detail.responseBody.text, /aggregated assistant answer/);
+    assert.doesNotMatch(detail.responseBody.text, /stream wire data/);
+    assert.equal(detail.statusCode, 200);
+    assert.equal(detail.isStream, true);
+  } finally {
+    await store.close();
+    rmSync(dir, { force: true, recursive: true });
+  }
+});
+
 test("RequestLogRuntime rejects an event that exceeds its hard queue byte limit", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-runtime-bound-test-"));
   const runtime = createRequestLogRuntime({
@@ -323,13 +519,14 @@ test("RequestLogRuntime persists unmatched raw trace updates across worker resta
   }
 });
 
-test("RequestLogStore retains a bounded prefix for oversized unmatched raw trace bodies", async () => {
+test("RequestLogStore stores oversized unmatched raw trace bodies in sidecar storage", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-pending-entry-budget-test-"));
   const store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
   try {
+    const body = "s".repeat(3 * 1024 * 1024);
     await store.writeBatch([{
       input: {
-        requestBodyText: "s".repeat(3 * 1024 * 1024),
+        requestBodyText: body,
         requestId: "oversized-pending-raw"
       },
       kind: "raw-trace-update",
@@ -344,25 +541,29 @@ test("RequestLogStore retains a bounded prefix for oversized unmatched raw trace
 
     const page = await store.list({ pageSize: 25 });
     const detail = await store.getDetail({ id: page.items[0].id });
-    assert.match(detail.requestBody.text, /^s+$/);
-    assert.equal(Buffer.byteLength(detail.requestBody.text), 512 * 1024);
-    assert.equal(detail.requestBody.sizeBytes, 3 * 1024 * 1024);
-    assert.equal(detail.requestBody.truncated, true);
+    assert.ok(detail.requestBody.bodyRef);
+    assert.equal(detail.requestBody.preview, true);
+    assert.match(detail.requestBody.text, /bytes omitted from preview/);
+    assert.equal(detail.requestBody.sizeBytes, Buffer.byteLength(body));
+    assert.equal(detail.requestBody.truncated, false);
+    assert.equal(await readStoredBodyText(store, page.items[0].id, "request"), body);
   } finally {
     await store.close();
     rmSync(dir, { force: true, recursive: true });
   }
 });
 
-test("RequestLogStore bounds unmatched request and response bodies independently", async () => {
+test("RequestLogStore stores unmatched request and response bodies independently", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-pending-body-budget-test-"));
   const store = new RequestLogStore(path.join(dir, "request-logs.sqlite"));
   try {
+    const requestBody = "q".repeat(3 * 1024 * 1024);
+    const responseBody = "p".repeat(3 * 1024 * 1024);
     await store.writeBatch([{
       input: {
-        requestBodyText: "q".repeat(3 * 1024 * 1024),
+        requestBodyText: requestBody,
         requestId: "oversized-pending-pair",
-        responseBodyText: "p".repeat(3 * 1024 * 1024)
+        responseBodyText: responseBody
       },
       kind: "raw-trace-update",
       sequence: 1
@@ -376,12 +577,14 @@ test("RequestLogStore bounds unmatched request and response bodies independently
 
     const page = await store.list({ pageSize: 25 });
     const detail = await store.getDetail({ id: page.items[0].id });
-    assert.equal(Buffer.byteLength(detail.requestBody.text), 512 * 1024);
-    assert.equal(Buffer.byteLength(detail.responseBody.text), 512 * 1024);
-    assert.equal(detail.requestBody.sizeBytes, 3 * 1024 * 1024);
-    assert.equal(detail.responseBody.sizeBytes, 3 * 1024 * 1024);
-    assert.equal(detail.requestBody.truncated, true);
-    assert.equal(detail.responseBody.truncated, true);
+    assert.ok(detail.requestBody.bodyRef);
+    assert.ok(detail.responseBody.bodyRef);
+    assert.equal(detail.requestBody.sizeBytes, Buffer.byteLength(requestBody));
+    assert.equal(detail.responseBody.sizeBytes, Buffer.byteLength(responseBody));
+    assert.equal(detail.requestBody.truncated, false);
+    assert.equal(detail.responseBody.truncated, false);
+    assert.equal(await readStoredBodyText(store, page.items[0].id, "request"), requestBody);
+    assert.equal(await readStoredBodyText(store, page.items[0].id, "response"), responseBody);
   } finally {
     await store.close();
     rmSync(dir, { force: true, recursive: true });
@@ -423,7 +626,9 @@ test("RequestLogStore enforces a total byte budget for unmatched raw trace rows"
     const oldest = await store.getDetail({ id: oldestEntry.id });
     const newest = await store.getDetail({ id: newestEntry.id });
     assert.match(oldest.requestBody.text, /worker-model/);
-    assert.match(newest.requestBody.text, /^(?:17)+$/);
+    assert.ok(newest.requestBody.bodyRef);
+    assert.match(newest.requestBody.text, /bytes omitted from preview/);
+    assert.match(await readStoredBodyText(store, newestEntry.id, "request"), /^(?:17)+$/);
   } finally {
     await store.close();
     rmSync(dir, { force: true, recursive: true });
@@ -460,7 +665,8 @@ test("RequestLogRuntime preserves original response sizes when normal body captu
     assert.equal(metadataEntry.resolvedModel, "resolved-model");
     assert.equal(metadataEntry.responseModel, "response-model");
     assert.equal(truncated.responseBody.sizeBytes, Buffer.byteLength(fullResponse));
-    assert.equal(Buffer.byteLength(truncated.responseBody.text), 512 * 1024);
+    assert.ok(truncated.responseBody.bodyRef);
+    assert.equal(Buffer.byteLength(await readStoredBodyText(runtime, truncatedEntry.id, "response")), 512 * 1024);
     assert.equal(truncated.responseBody.truncated, true);
     assert.equal(metadata.responseBody.sizeBytes, Buffer.byteLength("exists"));
     assert.equal(metadata.responseBody.text, "");
@@ -586,7 +792,7 @@ test("RequestLogRuntime keeps the record body-removal policy for later file-back
   }
 });
 
-test("RequestLogRuntime retains inline raw trace bodies below the default safety limit", async () => {
+test("RequestLogRuntime stores large inline raw trace bodies in sidecar storage", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-runtime-raw-body-test-"));
   const runtime = createRuntime(dir);
   try {
@@ -604,7 +810,9 @@ test("RequestLogRuntime retains inline raw trace bodies below the default safety
     const page = await runtime.list({ pageSize: 25 });
     const detail = await runtime.getDetail({ id: page.items[0].id });
     assert.equal(detail.responseBody.sizeBytes, Buffer.byteLength(body));
-    assert.equal(detail.responseBody.text.length, body.length);
+    assert.ok(detail.responseBody.bodyRef);
+    assert.match(detail.responseBody.text, /bytes omitted from preview/);
+    assert.equal(await readStoredBodyText(runtime, page.items[0].id, "response"), body);
     assert.equal(detail.responseBody.truncated, false);
   } finally {
     await runtime.close({ timeoutMs: 5_000 });
@@ -612,7 +820,7 @@ test("RequestLogRuntime retains inline raw trace bodies below the default safety
   }
 });
 
-test("RequestLogRuntime bounds file-backed raw bodies and cleans bundles only after ACK", async () => {
+test("RequestLogRuntime stores file-backed raw bodies and cleans bundles only after ACK", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ccr-request-log-runtime-raw-file-test-"));
   const spoolDir = path.join(dir, "raw-trace-spool");
   const bundleDir = path.join(spoolDir, "bundle");
@@ -643,8 +851,10 @@ test("RequestLogRuntime bounds file-backed raw bodies and cleans bundles only af
     const page = await runtime.list({ pageSize: 25 });
     const detail = await runtime.getDetail({ id: page.items[0].id });
     assert.equal(detail.responseBody.sizeBytes, Buffer.byteLength(body));
-    assert.equal(detail.responseBody.text.length, 256 * 1024);
-    assert.equal(detail.responseBody.truncated, true);
+    assert.ok(detail.responseBody.bodyRef);
+    assert.match(detail.responseBody.text, /bytes omitted from preview/);
+    assert.equal(await readStoredBodyText(runtime, page.items[0].id, "response"), body);
+    assert.equal(detail.responseBody.truncated, false);
   } finally {
     await runtime.close({ timeoutMs: 5_000 });
     rmSync(dir, { force: true, recursive: true });
@@ -685,8 +895,11 @@ test("RequestLogRuntime compacts Base64 images while reading file-backed raw tra
     const detail = await runtime.getDetail({ id: page.items[0].id });
     const captured = JSON.parse(detail.requestBody.text);
     assert.equal(detail.requestBody.sizeBytes, Buffer.byteLength(body));
-    assert.equal(detail.requestBody.truncated, true);
+    assert.ok(detail.requestBody.bodyRef);
+    assert.equal(detail.requestBody.truncated, false);
     assert.match(captured.image_url.url, /^data:image\/jpeg;base64,\[base64 image omitted from log;/);
+    const fullBody = JSON.parse(await readStoredBodyText(runtime, page.items[0].id, "request"));
+    assert.equal(fullBody.image_url.url, `data:image/jpeg;base64,${"A".repeat(512 * 1024)}`);
     assert.equal(existsSync(bundleDir), false);
   } finally {
     await runtime.close({ timeoutMs: 5_000 });
@@ -1619,6 +1832,20 @@ function createRuntime(dir, options = {}) {
     ...options,
     workerFile
   });
+}
+
+async function readStoredBodyText(source, id, side) {
+  let offset = 0;
+  const chunks = [];
+  while (true) {
+    const chunk = await source.getBodyChunk({ id, length: 512 * 1024, offset, side });
+    assert.ok(chunk, `expected ${side} body chunk at offset ${offset}`);
+    chunks.push(chunk.text);
+    if (chunk.eof) break;
+    assert.ok(chunk.nextOffset > offset);
+    offset = chunk.nextOffset;
+  }
+  return chunks.join("");
 }
 
 function createRecord(requestId) {

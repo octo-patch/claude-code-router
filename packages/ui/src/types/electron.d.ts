@@ -44,6 +44,8 @@ import type {
   LocalAgentProviderImportResult,
   LocalAgentProviderProbeRequest,
   LocalAgentProviderProbeResult,
+  OpenRouterProviderCatalogRequest,
+  OpenRouterProviderCatalogResult,
   PluginDirectorySelection,
   PluginMarketplaceEntry,
   ProfileOpenCommandResult,
@@ -70,6 +72,8 @@ import type {
   ProxyNetworkSnapshot,
   ProxyStatus,
   RequestLogDetailRequest,
+  RequestLogBodyChunk,
+  RequestLogBodyChunkRequest,
   RequestLogEntry,
   RequestLogListFilter,
   RequestLogPage,
@@ -79,6 +83,7 @@ import type {
   RouteScriptValidationResult,
   UsageStatsFilter,
   UsageStatsRange,
+  UsageStatsResetResult,
   UsageStatsSnapshot
 } from "@ccr/core/contracts/app";
 import type { ProviderPreset } from "@ccr/core/providers/presets/types";
@@ -111,12 +116,14 @@ declare global {
       getProfileRuntimeStatus: () => Promise<ProfileRuntimeStatus>;
       getProviderAccountSnapshots: (provider?: string, options?: ProviderAccountSnapshotRequestOptions) => Promise<ProviderAccountSnapshot[]>;
       getProviderCatalogModels: (request: ProviderCatalogModelsRequest) => Promise<ProviderCatalogModelsResult>;
+      getOpenRouterProviderCatalog: (request: OpenRouterProviderCatalogRequest) => Promise<OpenRouterProviderCatalogResult>;
       getProviderPresets: () => Promise<ProviderPreset[]>;
       getPluginMarketplace: () => Promise<PluginMarketplaceEntry[]>;
       getProxyCertificateStatus: () => Promise<ProxyCertificateStatus>;
       getProxyNetworkCaptures: () => Promise<ProxyNetworkSnapshot>;
       getProxyStatus: () => Promise<ProxyStatus>;
       getRequestLogDetail: (request: RequestLogDetailRequest) => Promise<RequestLogEntry | undefined>;
+      getRequestLogBodyChunk: (request: RequestLogBodyChunkRequest) => Promise<RequestLogBodyChunk | undefined>;
       getRequestLogs: (filter?: RequestLogListFilter) => Promise<RequestLogPage>;
       getUpdateStatus: () => Promise<AppUpdateStatus>;
       getUsageStats: (range?: UsageStatsRange, filter?: UsageStatsFilter) => Promise<UsageStatsSnapshot>;
@@ -136,9 +143,11 @@ declare global {
       revealProxyCertificate: () => Promise<void>;
       renderHtmlPng?: (request: AppRenderHtmlPngRequest) => Promise<AppRenderHtmlPngResult>;
       resetCodexRateLimitCredit: (request: ProviderAccountResetRequest) => Promise<ProviderAccountResetResult>;
+      resetOverviewStatistics: () => Promise<UsageStatsResetResult>;
       restartGateway: () => Promise<GatewayStatus>;
       restartProxy: () => Promise<ProxyStatus>;
       saveApiKeys: (apiKeys: ApiKeyConfig[]) => Promise<AppConfig>;
+      /** Saves settings while preserving the credentials managed by saveApiKeys. */
       saveConfig: (config: AppConfig, options?: AppSaveConfigOptions) => Promise<AppConfig>;
       selectPluginDirectory: () => Promise<PluginDirectorySelection | undefined>;
       setOnboardingFinished: () => Promise<boolean>;

@@ -2,11 +2,13 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import {
+  AppConfigConflictError,
+  appConfigRevision,
   archiveLegacyJsonConfigFiles,
   loadPersistedApiKeys,
   loadPersistedAppConfig,
   replacePersistedApiKeys,
-  replacePersistedAppConfig,
+  updatePersistedAppConfig,
   replacePersistedConfigSnapshot
 } from "@ccr/core/config/config-repository";
 import { LEGACY_ACTIVE_CONFIG_FILE, LEGACY_CONFIG_FILE, LEGACY_WINDOWS_CONFIG_FILE } from "@ccr/core/config/constants";
@@ -341,7 +343,11 @@ export async function loadAppConfig(): Promise<AppConfig> {
     const shouldRepairProviderCapabilities = hasUnsupportedNvidiaCapabilities(value.Providers);
     const shouldRepairKnownPlugins = pluginMigration.changed;
     if (loadedRawConfig.source !== "sqlite" || shouldPersistApiKeys || shouldRepairProviderCapabilities || shouldRepairKnownPlugins) {
-      await replacePersistedConfigSnapshot(sanitizeConfigForDisk(config), apiKeys);
+      const sanitized = sanitizeConfigForDisk(config);
+      await replacePersistedConfigSnapshot(sanitized, apiKeys, appConfigRevision(loadedRawConfig.source === "sqlite" ? rawValue : undefined));
+      config.configRevision = appConfigRevision(sanitized);
+    } else {
+      config.configRevision = appConfigRevision(rawValue);
     }
     if (loadedRawConfig.source === "legacy-json" && loadedRawConfig.legacyJsonFile) {
       await archiveLegacyJsonConfigFiles([loadedRawConfig.legacyJsonFile]).catch((archiveError) => {
@@ -350,6 +356,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
     }
     return config;
   } catch (error) {
+    if (error instanceof AppConfigConflictError) return loadAppConfig();
     console.warn(`[config] Failed to load config: ${formatError(error)}`);
     const persistedApiKeys = await loadPersistedApiKeys().catch((storeError) => {
       console.warn(`[config] Failed to load API keys: ${formatError(storeError)}`);
@@ -370,21 +377,17 @@ export async function loadAppConfig(): Promise<AppConfig> {
 }
 
 let appConfigWriteQueue: Promise<void> = Promise.resolve();
-let appThemePreferenceOverride: AppConfig["theme"] | undefined;
 
+/** Save settings; change gateway credentials through saveApiKeysConfig instead. */
 export async function saveAppConfig(config: AppConfig): Promise<AppConfig> {
   return enqueueAppConfigWrite(() => saveAppConfigNow(config));
 }
 
 export async function saveAppThemePreference(theme: unknown): Promise<AppConfig["theme"]> {
   const normalizedTheme = normalizeAppThemePreference(theme);
-  appThemePreferenceOverride = normalizedTheme;
   return enqueueAppConfigWrite(async () => {
-    const currentConfig = await loadAppConfig();
-    await writeSanitizedConfig({
-      ...currentConfig,
-      theme: normalizedTheme
-    });
+    await loadAppConfig();
+    await updatePersistedAppConfig((current) => ({ ...(isObject(current) ? current : {}), theme: normalizedTheme }));
     return normalizedTheme;
   });
 }
@@ -392,15 +395,13 @@ export async function saveAppThemePreference(theme: unknown): Promise<AppConfig[
 async function saveAppConfigNow(config: AppConfig): Promise<AppConfig> {
   const normalizedConfig = withSingleEnabledGlobalProfiles(config);
   assertProviderApiKeysAreSafe(normalizedConfig);
-  const apiKeys = ensureGatewayApiKeys(normalizeApiKeys(normalizedConfig.APIKEYS, normalizedConfig.APIKEY).filter((apiKey) => !isDefaultSeedApiKey(apiKey)));
   const pluginMigration = migrateKnownGatewayPluginConfigs(normalizedConfig.plugins);
-  await replacePersistedConfigSnapshot(sanitizeConfigForDisk({
+  // Credentials have their own save operation. A settings snapshot may predate
+  // a key revocation or rotation, so it must never replace the credential table.
+  await writeSanitizedConfig({
     ...normalizedConfig,
-    theme: appThemePreferenceOverride ?? normalizedConfig.theme,
-    APIKEY: apiKeys[0]?.key ?? "",
-    APIKEYS: apiKeys,
     plugins: pluginMigration.plugins
-  }), apiKeys);
+  });
   return loadAppConfig();
 }
 
@@ -663,8 +664,10 @@ function providerCredentialApiKey(credential: ProviderCredentialConfig): string 
 
 export async function saveApiKeysConfig(apiKeys: ApiKeyConfig[]): Promise<AppConfig> {
   const normalized = ensureGatewayApiKeys(normalizeApiKeys(apiKeys, undefined).filter((apiKey) => !isDefaultSeedApiKey(apiKey)));
-  await replacePersistedApiKeys(normalized);
-  return loadAppConfig();
+  return enqueueAppConfigWrite(async () => {
+    await replacePersistedApiKeys(normalized);
+    return loadAppConfig();
+  });
 }
 
 async function loadRawAppConfig(): Promise<RawAppConfigLoadResult> {
@@ -714,18 +717,23 @@ function readLegacyJsonConfig(): LegacyJsonConfigLoadResult | undefined {
 }
 
 async function writeSanitizedConfig(config: AppConfig): Promise<void> {
-  await replacePersistedAppConfig(sanitizeConfigForDisk(config));
+  const sanitized = sanitizeConfigForDisk(config);
+  await updatePersistedAppConfig((current) => {
+    if (current !== undefined && config.configRevision !== appConfigRevision(current)) {
+      throw new AppConfigConflictError();
+    }
+    return { ...sanitized, theme: isObject(current) && current.theme !== undefined ? current.theme : config.theme };
+  });
 }
 
-function sanitizeConfigForDisk(config: AppConfig): AppConfig {
+function sanitizeConfigForDisk(config: AppConfig): Record<string, unknown> {
+  const { configRevision: _revision, ...settings } = config;
+  const { coreHost: _coreHost, corePort: _corePort, ...gateway } = config.gateway;
   return {
-    ...config,
+    ...settings,
     APIKEY: "",
     APIKEYS: [],
-    gateway: {
-      ...config.gateway,
-      coreHost: INTERNAL_GATEWAY_CORE_HOST
-    },
+    gateway,
     Providers: withProviderIds(config.Providers),
     profile: sanitizeProfileConfigForDisk(config.profile)
   };
@@ -740,7 +748,7 @@ function sanitizeProfileConfigForDisk(profile: AppConfig["profile"]): AppConfig[
     ...synchronizedProfile,
     codex,
     profiles: synchronizedProfile.profiles.map((profileItem) => {
-      if (profileItem.agent !== "codex" && profileItem.agent !== "opencode" && profileItem.agent !== "kilo" && profileItem.agent !== "zcode") {
+      if (profileItem.agent !== "codex" && profileItem.agent !== "opencode" && profileItem.agent !== "kilo" && profileItem.agent !== "workbuddy" && profileItem.agent !== "zcode") {
         return profileItem;
       }
       const {
@@ -874,6 +882,10 @@ function pickConfig(value: Partial<AppConfig>): LoadedAppConfig {
   const trayIcon = parseTrayIconPreference((value as Record<string, unknown>).trayIcon);
   if (trayIcon) {
     config.trayIcon = trayIcon;
+  }
+  const trayShowTokenRate = (value as Record<string, unknown>).trayShowTokenRate;
+  if (typeof trayShowTokenRate === "boolean") {
+    config.trayShowTokenRate = trayShowTokenRate;
   }
   const trayBalanceProgress = parseTrayBalanceProgress((value as Record<string, unknown>).trayBalanceProgress);
   if (trayBalanceProgress) {
@@ -1288,11 +1300,22 @@ function parseTrayWidget(value: unknown): TrayWidgetConfig | undefined {
     return undefined;
   }
   const variant = parseTrayWidgetVariant(type, value.variant);
+  const accountProviders = type === "account" ? parseTrayWidgetAccountProviders(value) : [];
   return {
+    ...(accountProviders.length === 1 ? { accountProvider: accountProviders[0] } : {}),
+    ...(accountProviders.length > 0 ? { accountProviders } : {}),
     id: readString(value.id) || trayWidgetId(type),
     type,
     ...(variant ? { variant } : {})
   };
+}
+
+function parseTrayWidgetAccountProviders(value: Record<string, unknown>): string[] {
+  const accountProvider = readString(value.accountProvider);
+  return uniqueStrings([
+    ...parseStringList(value.accountProviders),
+    ...(accountProvider ? [accountProvider] : [])
+  ]);
 }
 
 function parseTrayWidgetType(value: unknown): TrayWidgetType | undefined {
@@ -1429,10 +1452,12 @@ function parseProviders(value: unknown): GatewayProviderConfig[] | undefined {
           ?? parseProviderProtocolCapability(item),
         credentials: parseProviderCredentials(item.credentials ?? item.keys ?? item.apiKeys),
         extraBody: item.extraBody,
-        extraHeaders: item.extraHeaders,
+        extraHeaders: item.extraHeaders ?? item.extra_headers ?? item.headers,
         icon: readString(item.icon),
         id: readString(item.id),
         enabled: item.enabled === false ? false : undefined,
+        autoFetchModels: readBoolean(item.autoFetchModels ?? item.auto_fetch_models ?? item.autoRefreshModels ?? item.auto_refresh_models),
+        autoFetchKnownModels: parseStringArray(item.autoFetchKnownModels ?? item.auto_fetch_known_models ?? item.autoRefreshKnownModels ?? item.auto_refresh_known_models),
         modelDescriptions,
         modelDisplayNames,
         modelMetadata,
@@ -1514,12 +1539,14 @@ function parseProviderModelMetadata(value: unknown): ProviderModelMetadata | und
   const effectiveContextWindowPercent = readPercentage(value.effectiveContextWindowPercent ?? value.effective_context_window_percent);
   const maxContextWindow = readPositiveInteger(value.maxContextWindow ?? value.max_context_window);
   const maxOutputTokens = readPositiveInteger(value.maxOutputTokens ?? value.max_output_tokens ?? value.outputTokens ?? value.output_tokens);
+  const openRouterDiscountRouting = parseOpenRouterDiscountRouting(value.openRouterDiscountRouting ?? value.open_router_discount_routing);
   const pricing = parseProviderModelPricing(value.pricing);
   const metadata: ProviderModelMetadata = {
     ...(Array.isArray(value.additionalSpeedTiers) ? { additionalSpeedTiers: value.additionalSpeedTiers } : {}),
     ...(Array.isArray(value.additional_speed_tiers) ? { additionalSpeedTiers: value.additional_speed_tiers } : {}),
     ...(capabilities ? { capabilities } : {}),
     ...(contextWindow ? { contextWindow } : {}),
+    ...(value.contextWindowPinned === true || value.context_window_pinned === true ? { contextWindowPinned: true } : {}),
     ...(value.defaultReasoningLevel === null ? { defaultReasoningLevel: null } : {}),
     ...(readString(value.defaultReasoningLevel) ? { defaultReasoningLevel: readString(value.defaultReasoningLevel) } : {}),
     ...(value.default_reasoning_level === null ? { defaultReasoningLevel: null } : {}),
@@ -1529,14 +1556,45 @@ function parseProviderModelMetadata(value: unknown): ProviderModelMetadata | und
     ...(effectiveContextWindowPercent ? { effectiveContextWindowPercent } : {}),
     ...(maxContextWindow ? { maxContextWindow } : {}),
     ...(maxOutputTokens ? { maxOutputTokens } : {}),
+    ...(openRouterDiscountRouting ? { openRouterDiscountRouting } : {}),
     ...(pricing ? { pricing } : {}),
     ...(Array.isArray(value.serviceTiers) ? { serviceTiers: value.serviceTiers } : {}),
     ...(Array.isArray(value.service_tiers) ? { serviceTiers: value.service_tiers } : {}),
+    ...(typeof value.supportsFastMode === "boolean" ? { supportsFastMode: value.supportsFastMode } : {}),
+    ...(typeof value.supports_fast_mode === "boolean" ? { supportsFastMode: value.supports_fast_mode } : {}),
     ...(supportedReasoningLevels ? { supportedReasoningLevels } : {}),
     ...(typeof value.supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries: value.supportsReasoningSummaries } : {}),
     ...(typeof value.supports_reasoning_summaries === "boolean" ? { supportsReasoningSummaries: value.supports_reasoning_summaries } : {})
   };
   return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function parseOpenRouterDiscountRouting(value: unknown): ProviderModelMetadata["openRouterDiscountRouting"] {
+  if (value === true) {
+    return { enabled: true };
+  }
+  if (value === false || !isObject(value)) {
+    return undefined;
+  }
+  const providerBlacklist = parseStringList(value.providerBlacklist ?? value.provider_blacklist ?? value.ignoredProviders ?? value.ignored_providers ?? value.ignore);
+  const routing: NonNullable<ProviderModelMetadata["openRouterDiscountRouting"]> = {
+    ...(typeof value.allowFallbacks === "boolean" ? { allowFallbacks: value.allowFallbacks } : {}),
+    ...(typeof value.allow_fallbacks === "boolean" ? { allowFallbacks: value.allow_fallbacks } : {}),
+    ...(readNonNegativeNumber(value.cacheHitRate ?? value.cache_hit_rate) !== undefined ? { cacheHitRate: readNonNegativeNumber(value.cacheHitRate ?? value.cache_hit_rate) } : {}),
+    ...(typeof value.enabled === "boolean" ? { enabled: value.enabled } : {}),
+    ...(readPositiveInteger(value.endpointTtlMs ?? value.endpoint_ttl_ms ?? value.priceTtlMs ?? value.price_ttl_ms) ? { endpointTtlMs: readPositiveInteger(value.endpointTtlMs ?? value.endpoint_ttl_ms ?? value.priceTtlMs ?? value.price_ttl_ms) } : {}),
+    ...(readPositiveInteger(value.minOutputTokens ?? value.min_output_tokens) ? { minOutputTokens: readPositiveInteger(value.minOutputTokens ?? value.min_output_tokens) } : {}),
+    ...(readNonNegativeNumber(value.minSavingsRatio ?? value.min_savings_ratio) !== undefined ? { minSavingsRatio: readNonNegativeNumber(value.minSavingsRatio ?? value.min_savings_ratio) } : {}),
+    ...(readNonNegativeNumber(value.minSavingsUsd ?? value.min_savings_usd) !== undefined ? { minSavingsUsd: readNonNegativeNumber(value.minSavingsUsd ?? value.min_savings_usd) } : {}),
+    ...(readNonNegativeNumber(value.minUptime5m ?? value.min_uptime_5m) !== undefined ? { minUptime5m: readNonNegativeNumber(value.minUptime5m ?? value.min_uptime_5m) } : {}),
+    ...(readNonNegativeNumber(value.outputTokenRatio ?? value.output_token_ratio) !== undefined ? { outputTokenRatio: readNonNegativeNumber(value.outputTokenRatio ?? value.output_token_ratio) } : {}),
+    ...(providerBlacklist.length > 0 ? { providerBlacklist } : {}),
+    ...(typeof value.requireParameters === "boolean" ? { requireParameters: value.requireParameters } : {}),
+    ...(typeof value.require_parameters === "boolean" ? { requireParameters: value.require_parameters } : {}),
+    ...(typeof value.respectExistingProviderOrder === "boolean" ? { respectExistingProviderOrder: value.respectExistingProviderOrder } : {}),
+    ...(typeof value.respect_existing_provider_order === "boolean" ? { respectExistingProviderOrder: value.respect_existing_provider_order } : {})
+  };
+  return Object.keys(routing).length > 0 ? routing : undefined;
 }
 
 function parseProviderModelCapabilities(value: unknown): ProviderModelCapabilities | undefined {
@@ -3283,6 +3341,11 @@ function gatewayPluginPermissionAlias(value: string): string {
     case "route":
     case "routes":
       return "gateway-routes";
+    case "gateway-request-transform":
+    case "gateway-request-transforms":
+    case "request-transform":
+    case "request-transforms":
+      return "gateway-request-transforms";
     case "proxy":
     case "proxy-route":
       return "proxy-routes";
@@ -3396,17 +3459,19 @@ function parseGatewayPluginCoreGateway(value: unknown): GatewayPluginConfig["cor
     return undefined;
   }
   const providerPlugins = Array.isArray(value.providerPlugins) ? value.providerPlugins : undefined;
+  const plugins = Array.isArray(value.plugins) ? value.plugins : undefined;
   const virtualModelProfiles = Array.isArray(value.virtualModelProfiles)
     ? value.virtualModelProfiles as NonNullable<GatewayPluginConfig["coreGateway"]>["virtualModelProfiles"]
     : undefined;
   const config = isObject(value.config) ? { ...(value.config as Record<string, unknown>) } : undefined;
 
-  if (!providerPlugins && !virtualModelProfiles && !config) {
+  if (!providerPlugins && !plugins && !virtualModelProfiles && !config) {
     return undefined;
   }
 
   return {
     ...(config ? { config } : {}),
+    ...(plugins ? { plugins } : {}),
     ...(providerPlugins ? { providerPlugins } : {}),
     ...(virtualModelProfiles ? { virtualModelProfiles } : {})
   };
@@ -3427,6 +3492,10 @@ function parseProfile(value: unknown): LoadedProfileConfig | undefined {
     profile.claudeCode = {};
     if (typeof claudeCode.enabled === "boolean") {
       profile.claudeCode.enabled = claudeCode.enabled;
+    }
+    const claudeSettings = parseUnknownRecord(claudeCode.claudeSettings ?? claudeCode.claude_settings ?? claudeCode.settings);
+    if (claudeSettings) {
+      profile.claudeCode.claudeSettings = claudeSettings;
     }
     const managedCompact = readManagedCompact(claudeCode);
     if (managedCompact !== undefined) {
@@ -3562,13 +3631,13 @@ function parseProfiles(value: unknown): ProfileConfig[] | undefined {
       const id = readString(item.id) || `profile-${index + 1}`;
       const name = readString(item.name) || defaultProfileAgentName(agent);
       const model = readString(item.model) ?? "";
-      const availableModels = uniqueStrings([
-        model,
-        ...parseStringList(item.availableModels ?? item.available_models ?? item.models)
-      ]);
+      const parsedAvailableModels = parseStringList(item.availableModels ?? item.available_models ?? item.models);
+      const availableModels = parsedAvailableModels.length > 0
+        ? uniqueStrings([model, ...parsedAvailableModels].filter(Boolean))
+        : undefined;
       const env = parseStringRecord(item.env) ?? {};
       const parsedSurface = parseProfileSurface(readString(item.surface) || readString(item.entry) || readString(item.frontend)) || "auto";
-      const surface = agent === "zcode" || agent === CLAUDE_DESIGN_PLUGIN_ID
+      const surface = agent === "workbuddy" || agent === "zcode" || agent === CLAUDE_DESIGN_PLUGIN_ID
         ? "app"
         : agent === "pi" || agent === "kilo"
           ? "cli"
@@ -3583,17 +3652,20 @@ function parseProfiles(value: unknown): ProfileConfig[] | undefined {
 
       if (agent === "claude-code") {
         const appPath = readProfileAppPath(item, agent);
+        const claudeSettings = parseUnknownRecord(item.claudeSettings ?? item.claude_settings);
         return {
           agent,
           ...(appPath ? { appPath } : {}),
           ...(botConfigId ? { botConfigId } : {}),
           ...(botGateway ? { botGateway } : {}),
+          ...(claudeSettings ? { claudeSettings } : {}),
           enabled,
           env: claudeCodeProfileEnv(env),
           fableModel: readString(item.fableModel) || readString(item.defaultFableModel) || "",
           haikuModel: readString(item.haikuModel) || readString(item.defaultHaikuModel) || readString(item.smallFastModel) || readString(item.smallModel) || "",
           id,
           ...(managedCompact !== undefined ? { managedCompact } : {}),
+          ...(availableModels ? { availableModels } : {}),
           model,
           name,
           opusModel: readString(item.opusModel) || readString(item.defaultOpusModel) || "",
@@ -3609,7 +3681,7 @@ function parseProfiles(value: unknown): ProfileConfig[] | undefined {
       if (agent === "grok" || agent === "kimi" || agent === "pi") {
         return {
           agent,
-          ...(agent === "kimi" ? { availableModels } : {}),
+          ...(availableModels ? { availableModels } : {}),
           enabled,
           env: codexCompatibleProfileEnv(env),
           id,
@@ -3636,7 +3708,7 @@ function parseProfiles(value: unknown): ProfileConfig[] | undefined {
       }
 
       const appPath = readProfileAppPath(item, agent);
-      const showAllSessions = agent === "zcode" || agent === "opencode" || agent === "kilo"
+      const showAllSessions = agent === "zcode" || agent === "opencode" || agent === "kilo" || agent === "workbuddy"
         ? false
         : typeof item.showAllSessions === "boolean"
           ? item.showAllSessions
@@ -3657,6 +3729,7 @@ function parseProfiles(value: unknown): ProfileConfig[] | undefined {
         env: codexCompatibleProfileEnv(env),
         id,
         ...(managedCompact !== undefined ? { managedCompact } : {}),
+        ...(availableModels ? { availableModels } : {}),
         model,
         name,
         providerId: readString(item.providerId) || readString(item.provider) || "claude-code-router",
@@ -3720,7 +3793,9 @@ function readProfileAppPath(item: Record<string, unknown>, agent: ProfileConfig[
         ? readString(item.chatgptAppPath) || readString(item.chatgpt_app_path) || readString(item.codexAppPath) || readString(item.codex_app_path)
         : agent === "opencode"
           ? readString(item.openCodeAppPath) || readString(item.opencodeAppPath) || readString(item.opencode_app_path)
-          : readString(item.zcodeAppPath) || readString(item.zcode_app_path));
+          : agent === "workbuddy"
+            ? readString(item.workbuddyAppPath) || readString(item.workbuddy_app_path) || readString(item.workBuddyAppPath) || readString(item.work_buddy_app_path)
+            : readString(item.zcodeAppPath) || readString(item.zcode_app_path));
 }
 
 function parseProfileAgent(value: unknown): ProfileConfig["agent"] | undefined {
@@ -3748,6 +3823,9 @@ function parseProfileAgent(value: unknown): ProfileConfig["agent"] | undefined {
   }
   if (normalized === "pi" || normalized === "pi-agent" || normalized === "pi agent" || normalized === "pi-coding-agent" || normalized === "pi coding agent") {
     return "pi";
+  }
+  if (normalized === "workbuddy" || normalized === "work-buddy" || normalized === "work buddy" || normalized === "workbuddy-agent" || normalized === "workbuddy agent") {
+    return "workbuddy";
   }
   if (normalized === "zcode" || normalized === "z-code" || normalized === "z code") {
     return "zcode";
@@ -3790,6 +3868,9 @@ function defaultProfileAgentName(agent: ProfileConfig["agent"]): string {
   if (agent === "pi") {
     return "Pi";
   }
+  if (agent === "workbuddy") {
+    return "Workbuddy";
+  }
   if (agent === CLAUDE_DESIGN_PLUGIN_ID) {
     return "Claude Design";
   }
@@ -3803,6 +3884,8 @@ function defaultCodexConfigFile(agent: ProfileConfig["agent"]): string {
       ? "~/.config/opencode/opencode.jsonc"
       : agent === "kilo"
         ? "~/.config/kilo/kilo.jsonc"
+        : agent === "workbuddy"
+          ? "~/.workbuddy/config.toml"
         : agent === "pi"
           ? "~/.pi/agent"
           : agent === CLAUDE_DESIGN_PLUGIN_ID
@@ -3821,6 +3904,7 @@ function normalizeCodexConfigFileForAgent(agent: ProfileConfig["agent"], value: 
 function profileFromClaudeCodeConfig(config: ClaudeCodeProfileConfig): ProfileConfig {
   return {
     agent: "claude-code",
+    ...(config.claudeSettings ? { claudeSettings: { ...config.claudeSettings } } : {}),
     enabled: config.enabled,
     env: claudeCodeProfileEnv(),
     fableModel: config.fableModel,

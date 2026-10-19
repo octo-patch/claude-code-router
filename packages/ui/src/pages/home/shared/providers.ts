@@ -20,6 +20,7 @@ import type {
   ProviderAccountConfig,
   ProviderAccountConnectorConfig,
   ProviderAccountHttpJsonConnectorConfig,
+  ProviderAccountMappedMeterConfig,
   ProviderAccountStandardConnectorConfig,
   ProviderAccountWebContentJsonConnectorConfig,
   ProviderCredentialConfig,
@@ -637,11 +638,15 @@ export function createProviderDraftFromDeepLinkPayload(
   return {
     ...accountDraft,
     apiKey: payload.apiKey?.trim() || "",
+    autoFetchModels: false,
+    autoFetchKnownModels: [],
     baseUrl,
     capabilities: payload.capabilities ?? [],
     catalogModelMetadata: undefined,
     credentialMode: "apiKey",
     credentials: [],
+    extraBodyText: "",
+    extraHeadersText: "",
     icon: payload.icon?.trim() || "",
     modelDescriptions: modelDescriptionsForModels(payload.modelDescriptions, models),
     modelDisplayNames: modelDisplayNamesForModels(
@@ -733,11 +738,15 @@ export function createProviderDraft(providers: GatewayProviderConfig[]): AddProv
   return {
     ...accountDraft,
     apiKey: "",
+    autoFetchModels: false,
+    autoFetchKnownModels: [],
     baseUrl: "",
     capabilities: [],
     catalogModelMetadata: undefined,
     credentialMode: "apiKey",
     credentials: [],
+    extraBodyText: "",
+    extraHeadersText: "",
     icon: "",
     modelDescriptions: undefined,
     modelDisplayNames: undefined,
@@ -763,11 +772,15 @@ export function createProviderDraftFromProvider(provider: GatewayProviderConfig)
   return {
     ...accountDraft,
     apiKey: providerApiKey(provider),
+    autoFetchModels: Boolean(provider.autoFetchModels),
+    autoFetchKnownModels: mergeProviderModelLists(provider.autoFetchKnownModels ?? []),
     baseUrl,
     capabilities: provider.capabilities ?? [],
     catalogModelMetadata: undefined,
     credentialMode: providerDraftHasReadyCredentialPool({ credentials }) ? "pool" : "apiKey",
     credentials,
+    extraBodyText: providerExtraJsonDraftText(provider.extraBody),
+    extraHeadersText: providerExtraJsonDraftText(provider.extraHeaders),
     icon: provider.icon ?? "",
     modelDescriptions: modelDescriptionsForModels(provider.modelDescriptions, provider.models),
     modelDisplayNames: modelDisplayNamesForModels(
@@ -1209,7 +1222,7 @@ export function createProviderAccountDraftFromConfig(account: ProviderAccountCon
       accountRefreshIntervalMs: account.refreshIntervalMs ? String(account.refreshIntervalMs) : ""
     };
   }
-  if (jsonConnector.parser) {
+  if (jsonConnector.parser || flatDraftDropsMeters(jsonConnector.mapping.meters)) {
     return {
       ...base,
       accountConnectorsText: JSON.stringify(connectors, null, 2),
@@ -1251,6 +1264,22 @@ export function createProviderAccountDraftFromConfig(account: ProviderAccountCon
     usageSubscriptionResetPath: stringValue(subscriptionMeter?.resetAt) || "",
     usageSubscriptionUnit: stringValue(subscriptionMeter?.unit) || "tokens"
   };
+}
+
+function isBalanceDraftMeter(meter: ProviderAccountMappedMeterConfig): boolean {
+  return meter.kind === "balance" || meter.id === "balance";
+}
+
+function isSubscriptionDraftMeter(meter: ProviderAccountMappedMeterConfig): boolean {
+  return meter.kind === "subscription" || meter.id === "subscription" || meter.kind === "quota" || meter.kind === "tokens" || meter.kind === "time_window";
+}
+
+function flatDraftDropsMeters(meters: ProviderAccountMappedMeterConfig[]): boolean {
+  const balanceMeters = meters.filter(isBalanceDraftMeter);
+  const subscriptionMeters = meters.filter((meter) => !isBalanceDraftMeter(meter) && isSubscriptionDraftMeter(meter));
+  return balanceMeters.length > 1
+    || subscriptionMeters.length > 1
+    || balanceMeters.length + subscriptionMeters.length !== meters.length;
 }
 
 function mappedStringDraftValue(value: string | string[] | undefined): string {
@@ -1816,7 +1845,9 @@ export async function probeProviderCandidates(
   apiKey: string,
   models: string[],
   options: {
+    forceRefresh?: boolean;
     mode?: "connectivity" | "models" | "protocols";
+    providerPlugins?: unknown[];
     protocols?: GatewayProviderProtocol[];
   } = {}
 ): Promise<ProviderProbeCandidateResult | undefined> {
@@ -1824,8 +1855,10 @@ export async function probeProviderCandidates(
   return await window.ccr?.probeProviderCandidates({
     apiKey: apiKey || undefined,
     candidates,
+    forceRefresh: options.forceRefresh,
     mode,
     models: mode === "connectivity" ? models : [],
+    providerPlugins: options.providerPlugins,
     protocols: options.protocols
   });
 }
@@ -1960,10 +1993,101 @@ export function providerCapabilitiesForSave(
   const normalizedNextBaseUrl = normalizeProviderBaseUrl(nextBaseUrl) || nextBaseUrl.trim();
   const preserveExisting = normalizedExistingBaseUrl === undefined ||
     normalizedExistingBaseUrl === normalizedNextBaseUrl;
+  const selectedTypes = new Set(currentCapabilities.map((capability) => capability.type));
+  const retainedCapabilities = preservedCapabilities.filter((capability) =>
+    selectedTypes.has(capability.type) ||
+    !providerProtocolOptions.some((option) => option.value === capability.type)
+  );
   return mergeProviderCapabilities(
     currentCapabilities,
-    ...(preserveExisting ? [preservedCapabilities] : [])
+    ...(preserveExisting ? [retainedCapabilities] : [])
   );
+}
+
+export type ProviderManualFields = Pick<
+  GatewayProviderConfig,
+  "billing" | "provider" | "transformer"
+>;
+
+/**
+ * Provider fields the setup dialog cannot edit.
+ *
+ * Saving rebuilds the provider from the dialog draft, so a field the form does
+ * not know about is dropped unless it is carried over explicitly. These fields
+ * only ever come from a hand-written config, and losing them is silent: the
+ * provider keeps working, just without the billing metadata or transformers it
+ * was configured with.
+ *
+ * `extraBody` and `extraHeaders` are not listed here — the Advanced settings
+ * section edits them, so they round-trip through the draft instead.
+ *
+ * The legacy `apiKey` / `apikey` / `baseUrl` / `baseurl` aliases are deliberately
+ * not carried over — the form writes the canonical `api_key` / `api_base_url`,
+ * and a stale alias would shadow the value the user just typed.
+ */
+export function providerManualFieldsForSave(
+  existingProvider: GatewayProviderConfig | undefined
+): ProviderManualFields {
+  if (!existingProvider) {
+    return {};
+  }
+  const preserved: ProviderManualFields = {
+    billing: existingProvider.billing,
+    provider: existingProvider.provider,
+    transformer: existingProvider.transformer
+  };
+  // Keep the saved provider free of keys it never had, so an unrelated edit does
+  // not show up as a config change.
+  for (const field of Object.keys(preserved) as Array<keyof ProviderManualFields>) {
+    if (preserved[field] === undefined) {
+      delete preserved[field];
+    }
+  }
+  return preserved;
+}
+
+export type ProviderExtraJsonField = "extraBody" | "extraHeaders";
+
+const providerExtraJsonInvalidMessages: Record<ProviderExtraJsonField, string> = {
+  extraBody: "Extra request body JSON is invalid.",
+  extraHeaders: "Extra request headers JSON is invalid."
+};
+
+const providerExtraJsonShapeMessages: Record<ProviderExtraJsonField, string> = {
+  extraBody: "Extra request body must be a JSON object.",
+  extraHeaders: "Extra request headers must be a JSON object."
+};
+
+export function providerExtraJsonDraftText(value: unknown): string {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+/**
+ * Parses one of the Advanced settings JSON boxes.
+ *
+ * Returns the parsed object, `undefined` when the box is empty, or an error
+ * message string the caller surfaces the same way as the other draft issues.
+ */
+export function parseProviderExtraJsonDraft(
+  text: string,
+  field: ProviderExtraJsonField
+): Record<string, unknown> | undefined | string {
+  if (!text.trim()) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return providerExtraJsonInvalidMessages[field];
+  }
+  if (!isPlainRecord(parsed)) {
+    return providerExtraJsonShapeMessages[field];
+  }
+  return parsed;
 }
 
 export function providerGlobalBaseUrlForProbe(
@@ -2028,6 +2152,13 @@ export function providerCapabilitiesForProtocols(
   return mergeProviderCapabilities(selectedCapabilities, detectedMediaCapabilities);
 }
 
+export function providerProbeModelsForProtocol(
+  probe: GatewayProviderProbeResult | undefined,
+  protocol: GatewayProviderProtocol
+): string[] {
+  return probe?.protocolModels?.[protocol] ?? probe?.models ?? [];
+}
+
 export function applyProviderProbeResult(draft: AddProviderDraft, probe: GatewayProviderProbeResult): AddProviderDraft {
   const detectedProtocol = probe.detectedProtocol ?? draft.protocol;
   const selectedProtocols = selectedProviderProtocolsForProbe(draft.selectedProtocols, probe, detectedProtocol, draft.presetId);
@@ -2036,13 +2167,14 @@ export function applyProviderProbeResult(draft: AddProviderDraft, probe: Gateway
     : selectedProtocols.includes(detectedProtocol)
     ? detectedProtocol
     : selectedProtocols[0] ?? detectedProtocol;
+  const probeModels = providerProbeModelsForProtocol(probe, protocol);
   const modelDisplayNames = mergeModelDisplayNames(draft.modelDisplayNames, probe.modelDisplayNames);
   const catalogModelMetadata = mergeModelMetadata(draft.catalogModelMetadata, probe.catalogModelMetadata);
   const modelMetadata = mergeModelMetadata(draft.modelMetadata, probe.modelMetadata);
   const accountDraft = providerProbeAccountDraftPatch(draft, probe.account);
   const baseUrl = providerGlobalBaseUrlForProbe(draft.baseUrl, probe, selectedProtocols);
 
-  if (probe.models.length === 0) {
+  if (probeModels.length === 0) {
     return {
       ...draft,
       ...accountDraft,
@@ -2056,7 +2188,7 @@ export function applyProviderProbeResult(draft: AddProviderDraft, probe: Gateway
     };
   }
 
-  const detectedModels = new Set(probe.models);
+  const detectedModels = new Set(probeModels);
   const typedModels = splitLines(draft.modelsText);
   const selectedCatalogModels = draft.selectedModels.filter((model) => detectedModels.has(model));
   const selectedCustomModels = draft.selectedModels.filter((model) => !detectedModels.has(model));
@@ -2066,7 +2198,7 @@ export function applyProviderProbeResult(draft: AddProviderDraft, probe: Gateway
   const customModels = mergeProviderModelLists(selectedCustomModels, typedCustomModels);
   const nextSelectedModels = selectedModels.length > 0 || customModels.length > 0
     ? selectedModels
-    : pickRecommendedProviderModels(probe.models, probe.detectedProtocol);
+    : pickRecommendedProviderModels(probeModels, probe.detectedProtocol);
 
   return {
     ...draft,
@@ -2119,7 +2251,15 @@ export function mergeModelMetadata(
       if (!model || !metadata || typeof metadata !== "object") {
         continue;
       }
-      merged[model] = metadata;
+      const pinned = merged[model]?.contextWindowPinned ? merged[model] : undefined;
+      merged[model] = pinned
+        ? {
+            ...metadata,
+            contextWindow: pinned.contextWindow,
+            contextWindowPinned: true,
+            maxContextWindow: pinned.maxContextWindow
+          }
+        : metadata;
     }
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
@@ -2164,6 +2304,43 @@ export function providerModelDisplayName(provider: GatewayProviderConfig, model:
 
 export function providerModelDisplayTitle(provider: GatewayProviderConfig, model: string): string {
   return providerModelDisplayName(provider, model);
+}
+
+export function providerAutoFetchKnownModelsForSave({
+  currentModels,
+  detectedModels = [],
+  draftKnownModels = [],
+  existingProvider,
+  nextBaseUrl
+}: {
+  currentModels: string[];
+  detectedModels?: string[];
+  draftKnownModels?: string[];
+  existingProvider?: GatewayProviderConfig;
+  nextBaseUrl: string;
+}): string[] | undefined {
+  const current = mergeProviderModelLists(currentModels);
+  const matchedExistingProvider = existingProvider && providerModelSourceMatches(existingProvider, nextBaseUrl)
+    ? existingProvider
+    : undefined;
+  const existingKnown = matchedExistingProvider
+    ? mergeProviderModelLists(matchedExistingProvider.autoFetchKnownModels ?? [], matchedExistingProvider.models)
+    : [];
+  const draftKnown = matchedExistingProvider ? mergeProviderModelLists(draftKnownModels) : [];
+  const detected = mergeProviderModelLists(detectedModels);
+  const known = mergeProviderModelLists(existingKnown, draftKnown, detected, current);
+  const currentKeys = new Set(current.map((model) => model.toLowerCase()));
+  const hasKnownModelsOutsideCurrentSelection = known.some((model) => !currentKeys.has(model.toLowerCase()));
+  const hasObservedCatalogBaseline = detected.length > 0;
+  const hasExistingBaseline = existingKnown.length > 0 || draftKnown.length > 0;
+
+  return hasKnownModelsOutsideCurrentSelection || hasObservedCatalogBaseline || hasExistingBaseline ? known : undefined;
+}
+
+function providerModelSourceMatches(provider: GatewayProviderConfig, nextBaseUrl: string): boolean {
+  const currentBaseUrl = normalizeProviderBaseUrl(providerBaseUrl(provider)).toLowerCase();
+  const nextNormalizedBaseUrl = normalizeProviderBaseUrl(nextBaseUrl).toLowerCase();
+  return Boolean(currentBaseUrl && nextNormalizedBaseUrl && currentBaseUrl === nextNormalizedBaseUrl);
 }
 
 export function pickRecommendedProviderModels(models: string[], protocol?: GatewayProviderProtocol): string[] {

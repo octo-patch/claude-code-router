@@ -2,7 +2,8 @@
  * Extracted from gateway/service.ts. Keep this module focused on its named gateway boundary.
  */
 import type { IncomingHttpHeaders } from "node:http";
-import { Readable, Transform } from "node:stream";
+import { pipeline, Readable, Transform } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import type { AppConfig } from "@ccr/core/contracts/app";
 import { normalizeRouteSelector } from "@ccr/core/routing/model-registry";
 import { isRecord, rawStringValue, stringValue } from "@ccr/core/gateway/internal/value";
@@ -289,10 +290,12 @@ function modelNameForPatchBridge(model: string | undefined): string {
 }
 
 
+// pipeline (not pipe) so an upstream error destroys the returned stream too;
+// the caller sees it there instead of as an unhandled 'error' on `input`.
 export function codexApplyPatchBridgeResponseStream(input: Readable, headers: Headers): Readable {
   const contentType = headers.get("content-type")?.toLowerCase() ?? "";
   if (contentType.includes("text/event-stream")) {
-    return input.pipe(new Transform({
+    return pipeline(input, new Transform({
       transform(chunk, _encoding, callback) {
         transformSseChunk(this, chunk);
         callback();
@@ -301,11 +304,11 @@ export function codexApplyPatchBridgeResponseStream(input: Readable, headers: He
         flushSseTransform(this);
         callback();
       }
-    }));
+    }), () => {});
   }
   if (contentType.includes("application/json")) {
     const chunks: Buffer[] = [];
-    return input.pipe(new Transform({
+    return pipeline(input, new Transform({
       transform(chunk, _encoding, callback) {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         callback();
@@ -321,7 +324,7 @@ export function codexApplyPatchBridgeResponseStream(input: Readable, headers: He
         }
         callback();
       }
-    }));
+    }), () => {});
   }
   return input;
 }
@@ -416,9 +419,17 @@ function patchInputFromVirtualApplyPatchArguments(value: unknown): string | unde
 }
 
 
+type CodexPatchBridgeSseTransform = Transform & {
+  __ccrCodexPatchBridgeSseDecoder?: StringDecoder;
+  __ccrCodexPatchBridgeSsePending?: string;
+};
+
 function transformSseChunk(stream: Transform, chunk: Buffer | string): void {
-  const state = stream as Transform & { __ccrCodexPatchBridgeSsePending?: string };
-  state.__ccrCodexPatchBridgeSsePending = (state.__ccrCodexPatchBridgeSsePending ?? "") + chunk.toString();
+  const state = stream as CodexPatchBridgeSseTransform;
+  const decoder = state.__ccrCodexPatchBridgeSseDecoder ?? new StringDecoder("utf8");
+  state.__ccrCodexPatchBridgeSseDecoder = decoder;
+  state.__ccrCodexPatchBridgeSsePending = (state.__ccrCodexPatchBridgeSsePending ?? "") +
+    decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   while (state.__ccrCodexPatchBridgeSsePending) {
     const match = /\r?\n\r?\n/.exec(state.__ccrCodexPatchBridgeSsePending);
     if (!match || match.index === undefined) {
@@ -433,7 +444,9 @@ function transformSseChunk(stream: Transform, chunk: Buffer | string): void {
 
 
 function flushSseTransform(stream: Transform): void {
-  const state = stream as Transform & { __ccrCodexPatchBridgeSsePending?: string };
+  const state = stream as CodexPatchBridgeSseTransform;
+  state.__ccrCodexPatchBridgeSsePending = (state.__ccrCodexPatchBridgeSsePending ?? "") +
+    (state.__ccrCodexPatchBridgeSseDecoder?.end() ?? "");
   if (state.__ccrCodexPatchBridgeSsePending) {
     stream.push(transformCodexApplyPatchBridgeSseEvent(state.__ccrCodexPatchBridgeSsePending));
     state.__ccrCodexPatchBridgeSsePending = "";

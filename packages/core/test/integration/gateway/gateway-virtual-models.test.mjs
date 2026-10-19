@@ -36,7 +36,7 @@ test("gateway config rewrites Fusion fixed base and vision models to core provid
           { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4", type: "anthropic_messages" }
         ],
         credentials: [{ apiKey: "test-key", id: "test-1" }],
-        models: ["glm-5.2", "glm-5v-turbo"],
+        models: ["glm-5.2", "glm-4.5-air", "glm-5v-turbo"],
         name: providerName,
         type: "openai_chat_completions"
       }
@@ -62,7 +62,9 @@ test("gateway config rewrites Fusion fixed base and vision models to core provid
       materialization: { enabled: true, includeInGatewayModels: true },
       metadata: {
         fusionVision: {
+          fallbackModels: [`${providerName}/glm-4.5-air`],
           modelSelector: `${providerName}/glm-5v-turbo`,
+          retryCount: 2,
           toolName: "vision_understand_glm_fusion"
         }
       },
@@ -80,6 +82,11 @@ test("gateway config rewrites Fusion fixed base and vision models to core provid
     profile.metadata.fusionVision.modelSelector,
     /^provider-zhipu-ai-china---coding-plan-[a-f0-9]{10}::openai_chat_completions::cred:test-1\/glm-5v-turbo$/
   );
+  assert.match(
+    profile.metadata.fusionVision.fallbackModels[0],
+    /^provider-zhipu-ai-china---coding-plan-[a-f0-9]{10}::openai_chat_completions::cred:test-1\/glm-4\.5-air$/
+  );
+  assert.equal(profile.metadata.fusionVision.retryCount, 2);
   assert.equal(profile.execution.maxToolCalls, Number.MAX_SAFE_INTEGER);
   assert.equal(profile.execution.maxTurns, Number.MAX_SAFE_INTEGER);
   assert.equal(profiles[0].baseModel.fixedModel, `${providerName}/glm-5.2`);
@@ -196,7 +203,9 @@ test("issue 1480 Fusion vision config injects core auth token into MCP gateway r
         materialization: { enabled: true, includeInGatewayModels: true },
         metadata: {
           fusionVision: {
+            fallbackModels: [`${providerName}/glm-4.5-air`],
             modelSelector: `${providerName}/glm-5v-turbo`,
+            retryCount: 1,
             toolName: "vision_understand_glm_5_2v"
           }
         },
@@ -232,6 +241,51 @@ test("issue 1480 Fusion vision config injects core auth token into MCP gateway r
     server.env.VISION_MODEL,
     /^provider-zhipu-ai-china---coding-plan-[a-f0-9]{10}::openai_chat_completions::cred:test-1\/glm-5v-turbo$/
   );
+  assert.equal(server.env.VISION_RETRY_COUNT, "1");
+  const fallbackModels = JSON.parse(server.env.VISION_FALLBACK_MODELS_JSON);
+  assert.equal(fallbackModels.length, 1);
+  assert.match(
+    fallbackModels[0],
+    /^provider-zhipu-ai-china---coding-plan-[a-f0-9]{10}::openai_chat_completions::cred:test-1\/glm-4\.5-air$/
+  );
+});
+
+test("gateway config injects Fusion vision media_ref tool instructions", () => {
+  const profiles = [
+    {
+      baseModel: { fixedModel: "Text/base-model", mode: "fixed" },
+      displayName: "Vision Fusion",
+      enabled: true,
+      execution: {
+        clientToolsPolicy: "allow",
+        matchMultimodal: true,
+        maxToolCalls: 8,
+        maxTurns: 6,
+        mode: "tool_loop",
+        streamMode: "optimistic"
+      },
+      id: "vision-fusion",
+      key: "vision-fusion",
+      match: { exactAliases: ["vision-fusion"], prefixes: [], suffixes: [] },
+      materialization: { enabled: true, includeInGatewayModels: true },
+      metadata: {
+        fusionVision: { modelSelector: "Vision/vision-model", toolName: "vision_understand_vision" }
+      },
+      tools: [{ name: "vision_understand_vision", visibility: "internal" }]
+    }
+  ];
+
+  const [profile] = normalizeCoreGatewayVirtualModelProfiles(profiles, {
+    Providers: [],
+    Router: { fallback: { mode: "off", models: [], retryCount: 0 } },
+    gateway: {}
+  });
+
+  assert.match(profile.instructions.append, /call the vision_understand_vision function tool before answering visual questions/);
+  assert.match(profile.instructions.append, /Use imageUrl or images\[\]\.url for refs listed as url/);
+  assert.match(profile.instructions.append, /Use imageBase64 or images\[\]\.base64 for refs listed as base64/);
+  assert.match(profile.instructions.append, /original media URL or base64 payload/);
+  assert.match(profile.instructions.append, /Do not search the filesystem for the media_ref/);
 });
 
 test("gateway config does not inject core auth token into external Fusion vision MCP runtime", async () => {
@@ -533,21 +587,26 @@ test("gateway resolves Claude discovery aliases before hosted web search matchin
       }
     ]
   };
-  const context = createHostedWebSearchProtocolContext({
-    body: Buffer.from(JSON.stringify({
-      messages: [{ content: "weather", role: "user" }],
-      model: "claude-Fusion/kimisearch",
-      tools: [{ name: "web_search", type: "web_search_20250305" }]
-    })),
-    config,
-    method: "POST",
-    path: "/v1/messages",
-    requestId: "request-1",
-    routedModel: "claude-Fusion/kimisearch",
-    sinceMs: 0
-  });
+  for (const tool of [
+    { name: "web_search", type: "web_search_20250305" },
+    { name: "WebSearch", input_schema: { type: "object" } }
+  ]) {
+    const context = createHostedWebSearchProtocolContext({
+      body: Buffer.from(JSON.stringify({
+        messages: [{ content: "weather", role: "user" }],
+        model: "claude-Fusion/kimisearch",
+        tools: [tool]
+      })),
+      config,
+      method: "POST",
+      path: "/v1/messages",
+      requestId: "request-1",
+      routedModel: "claude-Fusion/kimisearch",
+      sinceMs: 0
+    });
 
-  assert.equal(context?.toolName, "fusion_2_web_search");
+    assert.equal(context?.toolName, "fusion_2_web_search");
+  }
 });
 
 test("gateway does not route hosted web search through an unrelated Fusion search profile", () => {
@@ -707,6 +766,68 @@ test("gateway prefetches non-browser Fusion web search records without browser i
     assert.equal(requests[0].api_key, "tavily-key");
     assert.equal(requests[0].max_results, 3);
     assert.equal(requests[0].query, "search query");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("gateway prefetches Serply Fusion web search records", async () => {
+  const requests = [];
+  const endpoint = "http://127.0.0.1/serply-search";
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    requests.push({ headers: new Headers(init.headers), url: new URL(String(input)) });
+    return new Response(JSON.stringify({
+      results: [
+        { description: "First body", link: "https://example.test/one", title: "First" },
+        { description: "Second body", link: "https://example.test/two", title: "Second" },
+        { description: "Third body", link: "https://example.test/three", title: "Third" }
+      ]
+    }), { headers: { "content-type": "application/json" }, status: 200 });
+  };
+  try {
+    const config = {
+      Providers: [],
+      Router: { fallback: { mode: "off", models: [], retryCount: 0 } },
+      gateway: {},
+      virtualModelProfiles: [
+        {
+          displayName: "Research",
+          enabled: true,
+          id: "research",
+          key: "research",
+          match: { exactAliases: ["Fusion/research"], prefixes: [], suffixes: [] },
+          metadata: {
+            fusionWebSearch: {
+              env: { SERPLY_API_KEY: "serply-key", SERPLY_SEARCH_ENDPOINT: endpoint },
+              provider: "serply",
+              resultCount: 2,
+              toolName: "research_web_search"
+            }
+          }
+        }
+      ]
+    };
+
+    const records = await selectHostedWebSearchProtocolRecords({
+      protocol: "anthropic_messages",
+      queryHint: "search query",
+      requestId: "req-1",
+      sinceMs: Date.now() - 1000,
+      toolName: "research_web_search"
+    }, undefined, config);
+
+    assert.equal(records.length, 1);
+    assert.equal(records[0].engine, "serply");
+    assert.equal(records[0].searchUrl, "https://serply.io");
+    assert.deepEqual(records[0].results, [
+      { snippet: "First body", title: "First", url: "https://example.test/one" },
+      { snippet: "Second body", title: "Second", url: "https://example.test/two" }
+    ]);
+    assert.equal(requests[0].url.origin + requests[0].url.pathname, endpoint);
+    assert.equal(requests[0].url.searchParams.get("q"), "search query");
+    assert.equal(requests[0].url.searchParams.get("num"), "2");
+    assert.equal(requests[0].headers.get("x-api-key"), "serply-key");
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -1189,6 +1310,22 @@ test("gateway includes browser extraction diagnostics in hosted web search evide
   const parsed = JSON.parse(transformed.toString("utf8"));
 
   assert.match(parsed.messages[0].content, /Diagnostics: Page extraction failed/);
+});
+
+test("Cowork WebSearch is removed with its forced choice while custom tools survive", () => {
+  const customTools = ["web_search", "web_search_docs", "my_websearch"].map((name) => ({
+    name, input_schema: { type: "object" }
+  }));
+  const body = Buffer.from(JSON.stringify({
+    messages: [{ role: "user", content: "search docs" }],
+    tools: [{ name: "WebSearch", input_schema: { type: "object" } }, ...customTools],
+    tool_choice: { type: "tool", name: "WebSearch" }
+  }));
+  const parsed = JSON.parse(prepareAnthropicWebSearchProtocolRequestBody(
+    body, [sampleSearchRecord()], { queryHint: "search docs" }
+  ).toString("utf8"));
+  assert.deepEqual(parsed.tools, customTools);
+  assert.equal(parsed.tool_choice, undefined);
 });
 
 test("gateway hosted web search rewrites preserve custom web_search-named tools", () => {

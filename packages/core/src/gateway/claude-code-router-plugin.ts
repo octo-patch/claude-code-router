@@ -5,7 +5,7 @@ import path from "node:path";
 import { isGatewayProviderEnabled, type AppConfig, type ProfileClientKind, type ProfileConfig, type RequestRouteTraceChange, type RouterBuiltInAgentRuleId, type RouterFallbackConfig, type RouterRule, type RouterRuleCondition } from "@ccr/core/contracts/app";
 import { CONFIGDIR } from "@ccr/core/config/constants";
 import { applyAgentRequestEnrichers } from "@ccr/core/agents/request-enricher";
-import { buildClaudeAppGatewayModelRoutes, type ClaudeAppGatewayModelRoute, resolveClaudeAppGatewayRouteModel } from "@ccr/core/agents/claude-app/gateway-routes";
+import { buildClaudeAppGatewayModelRoutes, type ClaudeAppGatewayModelRoute, resolveClaudeAppGatewayRouteModel, stripClaudeAppGatewayOneMillionContextSuffix } from "@ccr/core/agents/claude-app/gateway-routes";
 import { claudeAppGatewayModelRouteOptions } from "@ccr/core/gateway/internal/shared";
 import { compileRouterConfig, type CompiledProfileRoutingConfig, type CompiledRouterConfig, type CompiledRouterRule } from "@ccr/core/routing/config-compiler";
 import type { RouteDecision, RouteDiagnostic, RouteModelRef, RouteRequest, RouteSource } from "@ccr/core/routing/contracts";
@@ -15,8 +15,10 @@ import type { RouteTraceObserver } from "@ccr/core/observability/route-trace";
 import { applyCompiledRouteRewrite, isBodyModelCompiledRewrite, type CompiledRouteRewrite } from "@ccr/core/routing/rewrite";
 import { buildRouteScriptInput } from "@ccr/core/routing/route-script-context";
 import { normalizeRouteScriptResult } from "@ccr/core/routing/route-script-result";
+import { calculateTokenCount } from "@ccr/core/routing/token-estimator";
 import type { RouteScriptRuntime } from "@ccr/core/routing/route-script-runtime";
 import { profileApiKeyId } from "@ccr/core/profiles/api-key";
+import { isModelAllowedForProfile } from "@ccr/core/profiles/model-allowlist";
 
 export { normalizeRouteSelector } from "@ccr/core/routing/model-registry";
 
@@ -51,11 +53,16 @@ const requireFromHere = createRequire(__filename);
 export class ClaudeCodeRouterPlugin {
   private readonly compiled: CompiledRouterConfig;
   private readonly event = new EventEmitter();
+  private readonly requiresProviderTokenCount: boolean;
   private readonly scriptRuntime?: RouteScriptRuntime;
 
   constructor(private readonly config: AppConfig, options: ClaudeCodeRouterPluginOptions = {}) {
     this.compiled = compileRouterConfig(config, { scriptValidationErrors: options.scriptValidationErrors });
     this.scriptRuntime = options.scriptRuntime;
+    // Provider selection consumes a plain token value after routing, including
+    // Fusion base models. Keep that value when its routing setting is enabled.
+    this.requiresProviderTokenCount = config.Providers.some(provider =>
+      Object.values(provider.modelMetadata ?? {}).some(metadata => metadata.openRouterDiscountRouting?.enabled));
   }
 
   async routeRequest(input: {
@@ -76,7 +83,8 @@ export class ClaudeCodeRouterPlugin {
     };
     applyAgentRequestEnrichers(request, [{
       enrich: (matchedRequest) => {
-        injectClaudeCodeAgentToolDescription(matchedRequest.body, this.config);
+        const profile = resolveBuiltInAgentProfile(matchedRequest, this.config, "claude-code");
+        injectClaudeCodeAgentToolDescription(matchedRequest.body, this.config, profile);
         injectClaudeCodeToolHubInstructions(matchedRequest.body, this.config);
         matchedRequest.builtInClaudeCodeSubagent = removeClaudeCodeBillingSystemHeader(matchedRequest.body);
         matchedRequest.builtInSubagentModel = extractAndRemoveClaudeCodeSubagentModelTag(matchedRequest.body);
@@ -85,9 +93,13 @@ export class ClaudeCodeRouterPlugin {
       matches: (candidate) => builtInAgentRouteMatches(candidate, this.config, "claude-code")
     }]);
     const sessionId = resolveSessionId(body, input.headers);
-    const tokenCount = calculateTokenCount(body.messages, body.system, body.tools);
+    let tokenCount: number | undefined;
     request.sessionId = sessionId;
-    request.tokenCount = tokenCount;
+    Object.defineProperty(request, "tokenCount", {
+      enumerable: true,
+      get: () => tokenCount ??= calculateTokenCount(body.messages, body.system, body.tools),
+      set: (value: number) => { tokenCount = value; }
+    });
 
     const customRouteStartedAt = Date.now();
     const requestedCustomModel = await this.resolveCustomRoute(request);
@@ -113,6 +125,7 @@ export class ClaudeCodeRouterPlugin {
     const routeDecisionStartedAt = Date.now();
     const runtimeDiagnostics: RouteDiagnostic[] = [];
     const configuredDecision = await resolveConfiguredRouteDecision(request, this.config, this.compiled, customModel, {
+      knownTokenCount: () => tokenCount,
       runtimeDiagnostics,
       scriptRuntime: this.scriptRuntime,
       trace: input.trace
@@ -181,7 +194,7 @@ export class ClaudeCodeRouterPlugin {
         reason: configuredDecision.reason,
         sessionId,
         source: configuredDecision.source,
-        tokenCount
+        tokenCount: this.requiresProviderTokenCount ? request.tokenCount ?? 0 : tokenCount ?? 0
       }
     };
   }
@@ -277,6 +290,7 @@ function isPathInside(file: string, root: string): boolean {
 }
 
 type RouteResolutionRuntime = {
+  knownTokenCount?: () => number | undefined;
   runtimeDiagnostics: RouteDiagnostic[];
   scriptRuntime?: RouteScriptRuntime;
   trace?: RouteTraceObserver;
@@ -543,7 +557,33 @@ function resolveConfiguredClaudeCodeModel(
   const discoveredTarget = target
     ? resolveClaudeAppGatewayRouteModel(target, config, claudeAppGatewayModelRouteOptions)
     : undefined;
-  return modelRegistry.resolve(discoveredTarget ?? target);
+  const strippedTarget = target
+    ? stripClaudeAppGatewayOneMillionContextSuffix(target)
+    : undefined;
+  const targetHasOneMillionContextSuffix = Boolean(target && strippedTarget && target !== strippedTarget);
+  const candidates: Array<{ canonicalize?: boolean; selector?: string }> = [
+    { selector: discoveredTarget },
+    { canonicalize: targetHasOneMillionContextSuffix, selector: strippedTarget },
+    { selector: target }
+  ];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (!candidate.selector) {
+      continue;
+    }
+    const key = candidate.selector.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const resolved = modelRegistry.resolve(candidate.selector);
+    if (resolved) {
+      return candidate.canonicalize
+        ? { ...resolved, selector: resolved.canonicalSelector }
+        : resolved;
+    }
+  }
+  return undefined;
 }
 
 function explicitClientModelCanOverrideBuiltInClaudeCodeRoute(
@@ -582,7 +622,9 @@ function resolveBuiltInAgentRouteDecision(
     if (!builtInAgentRouteMatches(request, config, agent)) {
       continue;
     }
-    const target = modelRegistry.resolve(resolveBuiltInAgentRouteTarget(request, config, agent));
+    const target = agent === "claude-code"
+      ? resolveBuiltInClaudeCodeRouteTarget(request, config, modelRegistry)
+      : modelRegistry.resolve(resolveBuiltInAgentRouteTarget(request, config, agent));
     if (!target) {
       continue;
     }
@@ -705,6 +747,18 @@ function resolveBuiltInAgentRouteTarget(
   agent: RouterBuiltInAgentRuleId
 ): string | undefined {
   return normalizeRouteSelector(resolveBuiltInAgentProfile(request, config, agent)?.model);
+}
+
+function resolveBuiltInClaudeCodeRouteTarget(
+  request: MutableRequestLike,
+  config: AppConfig,
+  modelRegistry: ModelRegistry
+): RouteModelRef | undefined {
+  return resolveConfiguredClaudeCodeModel(
+    resolveBuiltInAgentRouteTarget(request, config, "claude-code"),
+    config,
+    modelRegistry
+  );
 }
 
 function builtInAgentUserAgentNeedle(agent: RouterBuiltInAgentRuleId): string {
@@ -842,12 +896,12 @@ function systemContainsInstruction(system: unknown, marker: string): boolean {
     : isRecord(block) && typeof block.text === "string" && block.text.includes(marker));
 }
 
-function injectClaudeCodeAgentToolDescription(body: Record<string, unknown>, config: AppConfig): void {
+function injectClaudeCodeAgentToolDescription(body: Record<string, unknown>, config: AppConfig, profile?: ProfileConfig): void {
   if (!Array.isArray(body.tools)) {
     return;
   }
 
-  const instructions = claudeCodeAgentToolInstructions(config);
+  const instructions = claudeCodeAgentToolInstructions(config, profile);
   if (!instructions) {
     return;
   }
@@ -914,8 +968,8 @@ function appendDescriptionInstruction(description: string | undefined, instructi
   return existing ? `${existing}\n\n${instruction}` : instruction;
 }
 
-function claudeCodeAgentToolInstructions(config: AppConfig): { prompt: string; tool: string; workflow: string } | undefined {
-  const modelRows = configuredSubagentModelDescriptionRows(config);
+function claudeCodeAgentToolInstructions(config: AppConfig, profile?: ProfileConfig): { prompt: string; tool: string; workflow: string } | undefined {
+  const modelRows = configuredSubagentModelDescriptionRows(config, profile);
   if (modelRows.length === 0) {
     return undefined;
   }
@@ -942,9 +996,12 @@ function claudeCodeAgentToolInstructions(config: AppConfig): { prompt: string; t
   };
 }
 
-function configuredSubagentModelDescriptionRows(config: AppConfig): string[] {
+function configuredSubagentModelDescriptionRows(config: AppConfig, profile?: ProfileConfig): string[] {
   const routeByTarget = new Map<string, ClaudeAppGatewayModelRoute>();
   for (const route of buildClaudeAppGatewayModelRoutes(config, claudeAppGatewayModelRouteOptions)) {
+    if (!isModelAllowedForProfile(config, profile, route.targetModel)) {
+      continue;
+    }
     const key = route.targetModel.toLowerCase();
     const current = routeByTarget.get(key);
     if (!current || (current.oneMillionContext && !route.oneMillionContext)) {
@@ -1201,9 +1258,14 @@ async function resolveRouterRule(
       });
       return undefined;
     }
-    const context = buildRouteScriptInput(request, { profileId: options.auth.profileId });
+    const context = buildRouteScriptInput(request, {
+      deferTokenCount: true,
+      profileId: options.auth.profileId,
+      tokenCount: runtime.knownTokenCount?.()
+    });
     const startedAtMs = Date.now();
     const execution = await runtime.scriptRuntime.execute(rule.id, rule.script, context);
+    if (execution.tokenCount !== undefined) request.tokenCount = execution.tokenCount;
     if (execution.status !== "ok") {
       const timeout = execution.status === "timeout";
       const diagnostic: RouteDiagnostic = {
@@ -1583,59 +1645,6 @@ function routerRuleReason(
 
 function isSubagentModelPlaceholder(model: string): boolean {
   return model.trim().toLowerCase() === ccrSubagentModelPlaceholder;
-}
-
-function calculateTokenCount(messages: unknown, system: unknown, tools: unknown): number {
-  return countMessageTokens(messages) + countSystemTokens(system) + countToolTokens(tools);
-}
-
-function countMessageTokens(messages: unknown): number {
-  if (!Array.isArray(messages)) {
-    return 0;
-  }
-  return messages.reduce((total, message) => total + countUnknownTokens(message), 0);
-}
-
-function countSystemTokens(system: unknown): number {
-  return countUnknownTokens(system);
-}
-
-function countToolTokens(tools: unknown): number {
-  if (!Array.isArray(tools)) {
-    return 0;
-  }
-  return tools.reduce((total, tool) => total + countUnknownTokens(tool), 0);
-}
-
-function countUnknownTokens(value: unknown): number {
-  if (typeof value === "string") {
-    return estimateTextTokens(value);
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return 1;
-  }
-
-  if (Array.isArray(value)) {
-    return value.reduce((total, item) => total + countUnknownTokens(item), 0);
-  }
-
-  if (!isRecord(value)) {
-    return 0;
-  }
-
-  let total = 0;
-  for (const [key, item] of Object.entries(value)) {
-    total += estimateTextTokens(key);
-    total += countUnknownTokens(item);
-  }
-  return total;
-}
-
-function estimateTextTokens(text: string): number {
-  const asciiWords = text.match(/[A-Za-z0-9_]+|[^\sA-Za-z0-9_]/g)?.length ?? 0;
-  const cjkChars = text.match(/[\u3400-\u9fff]/g)?.length ?? 0;
-  return Math.max(1, Math.ceil((asciiWords + cjkChars) * 1.15));
 }
 
 function resolveSessionId(body: Record<string, unknown>, headers: Record<string, HeaderValue>): string | undefined {

@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { loadAppConfig } from "@ccr/core/config/config.ts";
 import { createDefaultAppConfig } from "@ccr/core/config/default-config.ts";
-import { replacePersistedAppConfig } from "@ccr/core/config/config-repository.ts";
+import { replacePersistedApiKeys, replacePersistedAppConfig } from "@ccr/core/config/config-repository.ts";
 import { CONFIGDIR } from "@ccr/core/config/constants.ts";
 import { applyProfileConfig, cleanupGeneratedBinBackups, resolveGrokSourceHome, resolveKimiSourceHome, restoreInactiveGlobalProfileConfigs, restoreGlobalProfileConfigsOnExit } from "@ccr/core/profiles/service.ts";
 
@@ -57,6 +57,7 @@ test("profile service cleans stale generated bin backups only", () => {
     mkdirSync(binDir, { recursive: true });
     const deletedFiles = [
       "ccr-claude-code-api-key-default.ccr-backup-2026-01-01T00-00-00-000Z",
+      "ccr-claude-code-wif-token-default.ccr-backup-2026-01-01T00-00-00-000Z",
       "ccr-claude-code-wrapper-default.ccr-original",
       "ccr-codex-cli-stdio-default.ccr-original-missing",
       "ccr-codex-cli-middleware.js.ccr-backup-2026-01-01T00-00-00-000Z",
@@ -114,7 +115,9 @@ test("profile service preserves user statusLine when the active global Claude ta
     const profile = {
       agent: "claude-code",
       enabled: true,
-      env: {},
+      env: {
+        CCR_CLAUDE_CODE_AUTH_MODE: "wif"
+      },
       id: "default-claude-code",
       model: "Provider/model",
       name: "Claude Code",
@@ -123,6 +126,7 @@ test("profile service preserves user statusLine when the active global Claude ta
       smallFastModel: "",
       surface: "auto"
     };
+    mkdirSync(path.dirname(takeoverFile), { recursive: true });
     writeFileSync(takeoverFile, `${JSON.stringify({
       profiles: [{
         agent: "claude-code",
@@ -149,13 +153,14 @@ test("profile service preserves user statusLine when the active global Claude ta
     }];
     config.profile.profiles = [profile];
 
-    const result = await applyProfileConfig(config);
+    const result = await applyProfileFixture(config);
     assert.equal(result.clients.some((client) => client.client === "claude-code" && client.ok), true);
     const current = JSON.parse(readFileSync(settingsFile, "utf8"));
     assert.deepEqual(current.statusLine, {
       command: "ccstatusline",
       type: "command"
     });
+    assert.equal(current.apiKeyHelper, undefined);
     assert.equal(current.currentOnly, "kept");
     assert.equal(current.theme, undefined);
     assert.equal(current.env.USER_VALUE, "kept");
@@ -205,7 +210,7 @@ test("profile service does not overwrite invalid global Claude settings JSON", {
     }];
     config.profile.profiles = [profile];
 
-    const result = await applyProfileConfig(config);
+    const result = await applyProfileFixture(config);
     const status = result.clients.find((client) => client.client === "claude-code");
     assert.equal(status?.ok, false);
     assert.match(status?.message ?? "", /not valid JSON/);
@@ -260,7 +265,7 @@ test("profile service honors the top-level profile disabled flag", { skip: !proc
     config.profile.enabled = false;
     config.profile.profiles = [profile];
 
-    const result = await applyProfileConfig(config);
+    const result = await applyProfileFixture(config);
     const status = result.clients.find((client) => client.client === "claude-code");
     assert.equal(result.enabled, false);
     assert.equal(status?.enabled, false);
@@ -317,6 +322,7 @@ test("profile service does not rewrite user Claude settings for stale legacy pro
     writeFileSync(`${settingsFile}.ccr-original`, originalSettings);
     writeFileSync(`${settingsFile}.ccr-backup-2026-07-28T16-26-39-119Z`, backupSettings);
     writeFileSync(settingsFile, userSettings);
+    mkdirSync(path.dirname(takeoverFile), { recursive: true });
     writeFileSync(takeoverFile, `${JSON.stringify({
       profiles: [{
         agent: "claude-code",
@@ -342,7 +348,7 @@ test("profile service does not rewrite user Claude settings for stale legacy pro
     assert.equal(loadedConfig.profile.codex.enabled, false);
     assert.deepEqual(loadedConfig.profile.profiles, []);
 
-    const result = await applyProfileConfig(loadedConfig);
+    const result = await applyProfileFixture(loadedConfig);
     assert.equal(result.enabled, false);
     assert.equal(readFileSync(settingsFile, "utf8"), userSettings);
     assert.deepEqual(
@@ -370,7 +376,9 @@ test("profile service does not rewrite Claude settings when only user-managed fi
     const profile = {
       agent: "claude-code",
       enabled: true,
-      env: {},
+      env: {
+        CCR_CLAUDE_CODE_AUTH_MODE: "wif"
+      },
       id: "user-fields-claude-settings",
       model: "Provider/model",
       name: "User Fields Claude Settings",
@@ -395,9 +403,10 @@ test("profile service does not rewrite Claude settings when only user-managed fi
     }];
     config.profile.profiles = [profile];
 
-    const initialResult = await applyProfileConfig(config);
+    const initialResult = await applyProfileFixture(config);
     assert.equal(initialResult.clients.some((client) => client.client === "claude-code" && client.ok), true);
     const settings = JSON.parse(readFileSync(settingsFile, "utf8"));
+    settings.apiKeyHelper = "/usr/local/bin/custom-claude-helper";
     settings.disableAllHooks = true;
     settings.statusLine = {
       command: "ccstatusline",
@@ -406,9 +415,97 @@ test("profile service does not rewrite Claude settings when only user-managed fi
     const userEditedContent = JSON.stringify(settings);
     writeFileSync(settingsFile, userEditedContent);
 
-    const secondResult = await applyProfileConfig(config);
+    const secondResult = await applyProfileFixture(config);
     assert.equal(secondResult.clients.some((client) => client.client === "claude-code" && client.ok), true);
     assert.equal(readFileSync(settingsFile, "utf8"), userEditedContent);
+  } finally {
+    restoreGlobalProfileConfigsOnExit([], { manageMarker: true });
+    rmSync(takeoverFile, { force: true });
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("profile service applies and removes profile Claude settings", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ccr-claude-profile-settings-"));
+  const takeoverFile = path.join(CONFIGDIR, "global-profile-takeover.json");
+  const profileId = "custom-claude-settings";
+  try {
+    rmSync(takeoverFile, { force: true });
+    const settingsFile = path.join(root, ".claude", "settings.json");
+    mkdirSync(path.dirname(settingsFile), { recursive: true });
+    writeFileSync(settingsFile, `${JSON.stringify({
+      env: {
+        USER_VALUE: "kept"
+      },
+      permissions: {
+        allow: ["Bash(echo:*)"],
+        defaultMode: "ask"
+      },
+      theme: "dark"
+    }, null, 2)}\n`);
+
+    const profile = {
+      agent: "claude-code",
+      claudeSettings: {
+        includeCoAuthoredBy: false,
+        permissions: {
+          defaultMode: "acceptEdits"
+        }
+      },
+      enabled: true,
+      env: {
+        CCR_CLAUDE_CODE_AUTH_MODE: "wif",
+        CLAUDE_CODE_MAX_RETRIES: "3"
+      },
+      id: profileId,
+      model: "Provider/model",
+      name: "Custom Claude Settings",
+      scope: "global",
+      settingsFile,
+      smallFastModel: "",
+      surface: "auto"
+    };
+    const config = createDefaultAppConfig();
+    config.APIKEY = "ccr-profile-claude-settings-test";
+    config.APIKEYS = [{
+      createdAt: "2026-01-01T00:00:00.000Z",
+      id: `profile:${profile.id}`,
+      key: "ccr-profile-claude-settings-test",
+      name: "Profile: Custom Claude Settings"
+    }];
+    config.Providers = [{
+      api_base_url: "https://example.test/v1",
+      api_key: "provider-key",
+      models: ["model"],
+      name: "Provider"
+    }];
+    config.profile.profiles = [profile];
+
+    const firstResult = await applyProfileFixture(config);
+    assert.equal(firstResult.clients.some((client) => client.client === "claude-code" && client.ok), true);
+    const firstSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+    assert.equal(firstSettings.includeCoAuthoredBy, false);
+    assert.equal(firstSettings.permissions.defaultMode, "acceptEdits");
+    assert.deepEqual(firstSettings.permissions.allow, ["Bash(echo:*)"]);
+    assert.equal(firstSettings.theme, "dark");
+    assert.equal(firstSettings.env.USER_VALUE, "kept");
+    assert.equal(firstSettings.env.CLAUDE_CODE_MAX_RETRIES, "3");
+
+    config.profile.profiles = [{
+      ...profile,
+      claudeSettings: {},
+      env: {
+        CCR_CLAUDE_CODE_AUTH_MODE: "wif"
+      }
+    }];
+    const secondResult = await applyProfileFixture(config);
+    assert.equal(secondResult.clients.some((client) => client.client === "claude-code" && client.ok), true);
+    const secondSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+    assert.equal(secondSettings.includeCoAuthoredBy, undefined);
+    assert.equal(secondSettings.permissions.defaultMode, undefined);
+    assert.deepEqual(secondSettings.permissions.allow, ["Bash(echo:*)"]);
+    assert.equal(secondSettings.env.CLAUDE_CODE_MAX_RETRIES, undefined);
+    assert.equal(secondSettings.env.USER_VALUE, "kept");
   } finally {
     restoreGlobalProfileConfigsOnExit([], { manageMarker: true });
     rmSync(takeoverFile, { force: true });
@@ -449,7 +546,7 @@ test("profile service can exclude ZCode from automatic synchronization", async (
       }
     ];
 
-    const result = await applyProfileConfig(config, { excludeAgents: ["zcode"] });
+    const result = await applyProfileFixture(config, { excludeAgents: ["zcode"] });
 
     assert.equal(result.enabled, false);
     assert.deepEqual(result.clients, []);
@@ -463,18 +560,30 @@ test("profile service can exclude ZCode from automatic synchronization", async (
 test("profile service overwrites generated bin files without creating backups", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
   const profileId = "generated-bin-test";
   const commandExtension = process.platform === "win32" ? ".cmd" : "";
+  const wifTokenExtension = process.platform === "win32" ? ".txt" : "";
   const binDir = path.join(CONFIGDIR, "bin");
   mkdirSync(binDir, { recursive: true });
+  const legacyApiKeyHelperFile = path.join(binDir, `ccr-claude-code-api-key-${profileId}${commandExtension}`);
   const generatedFiles = [
-    path.join(binDir, `ccr-claude-code-api-key-${profileId}${commandExtension}`),
+    path.join(binDir, `ccr-claude-code-wif-token-${profileId}${wifTokenExtension}`),
     path.join(binDir, `ccr-claude-code-wrapper-${profileId}${commandExtension}`),
     path.join(binDir, "ccr-codex-cli-middleware.js"),
     path.join(binDir, "toolhub-mcp.js")
   ];
+  const staleClaudeCodeGeneratedFiles = [
+    path.join(binDir, `ccr-claude-code-wif-token-stale-claude-code${wifTokenExtension}`),
+    path.join(binDir, `ccr-claude-code-wrapper-stale-claude-code${commandExtension}`)
+  ];
+  writeFileSync(legacyApiKeyHelperFile, "old generated content\n");
+  writeFileSync(`${legacyApiKeyHelperFile}.ccr-backup-2026-01-01T00-00-00-000Z`, "old backup\n");
+  writeFileSync(`${legacyApiKeyHelperFile}.ccr-original`, "old original\n");
   for (const file of generatedFiles) {
     writeFileSync(file, "old generated content\n");
     writeFileSync(`${file}.ccr-backup-2026-01-01T00-00-00-000Z`, "old backup\n");
     writeFileSync(`${file}.ccr-original`, "old original\n");
+  }
+  for (const file of staleClaudeCodeGeneratedFiles) {
+    writeFileSync(file, "stale generated content\n");
   }
 
   const config = createDefaultAppConfig();
@@ -482,7 +591,15 @@ test("profile service overwrites generated bin files without creating backups", 
     {
       api_base_url: "https://example.test/v1",
       api_key: "provider-key",
-      models: ["model"],
+      modelMetadata: {
+        model: {
+          contextWindow: 258400
+        },
+        long: {
+          contextWindow: 1_000_000
+        }
+      },
+      models: ["model", "long"],
       name: "Provider"
     }
   ];
@@ -521,11 +638,16 @@ test("profile service overwrites generated bin files without creating backups", 
     {
       agent: "claude-code",
       enabled: true,
-      env: {},
+      env: {
+        ANTHROPIC_API_KEY: "profile-api-key",
+        ANTHROPIC_AUTH_TOKEN: "profile-auth-token",
+        CCR_CLAUDE_CODE_AUTH_MODE: "wif",
+        CLAUDE_CODE_USE_GATEWAY: "1"
+      },
       fableModel: "Provider/fable",
       haikuModel: "Provider/haiku",
       id: profileId,
-      model: "Provider/model",
+      model: "Provider/long",
       name: "Generated Bin Test",
       opusModel: "Provider/opus",
       scope: "ccr",
@@ -535,12 +657,34 @@ test("profile service overwrites generated bin files without creating backups", 
       surface: "auto"
     }
   ];
+  const claudeProfileDir = path.join(CONFIGDIR, "profiles", profileId, "claude");
+  mkdirSync(claudeProfileDir, { recursive: true });
+  writeFileSync(path.join(claudeProfileDir, ".claude.json"), `${JSON.stringify({ firstStartTime: "2026-01-01T00:00:00.000Z" }, null, 2)}\n`);
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].ok, true);
+  assert.equal(existsSync(legacyApiKeyHelperFile), false);
   for (const file of generatedFiles) {
     assert.notEqual(readFileSync(file, "utf8"), "old generated content\n");
+  }
+  for (const file of staleClaudeCodeGeneratedFiles) {
+    assert.equal(existsSync(file), false);
+  }
+  const wifTokenFile = path.join(binDir, `ccr-claude-code-wif-token-${profileId}${wifTokenExtension}`);
+  assert.equal(readFileSync(wifTokenFile, "utf8"), "ccr-profile-test\n");
+  const wrapperContent = readFileSync(path.join(binDir, `ccr-claude-code-wrapper-${profileId}${commandExtension}`), "utf8");
+  assert.equal(wrapperContent.includes("profile-api-key"), false);
+  assert.equal(wrapperContent.includes("profile-auth-token"), false);
+  assert.equal(wrapperContent.includes("CCR_REMOTE_SYNC_API_KEY_HELPER"), false);
+  assert.equal(wrapperContent.includes("CCR_REMOTE_SYNC_API_KEY_FILE"), true);
+  assert.equal(wrapperContent.includes("ANTHROPIC_FEDERATION_RULE_ID"), true);
+  assert.equal(wrapperContent.includes("ANTHROPIC_IDENTITY_TOKEN_FILE"), true);
+  assert.equal(wrapperContent.includes("CLAUDE_CODE_USE_GATEWAY=1"), false);
+  if (process.platform === "win32") {
+    assert.match(wrapperContent, /CLAUDE_CODE_USE_GATEWAY="?/);
+  } else {
+    assert.match(wrapperContent, /unset CLAUDE_CODE_USE_GATEWAY/);
   }
   const toolHubMcpConfigFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "toolhub-mcp.json");
   const toolHubMcpConfig = JSON.parse(readFileSync(toolHubMcpConfigFile, "utf8"));
@@ -550,23 +694,244 @@ test("profile service overwrites generated bin files without creating backups", 
   assert.equal(toolHubMcpServerEnv.TOOLHUB_OPENAI_BASE_URL, `http://127.0.0.1:${config.gateway.port}/v1`);
   assert.equal(toolHubMcpServerEnv.TOOLHUB_OPENAI_MODEL, "Provider/model");
   assert.equal(contextArchiveMcpServer, undefined);
-  const settingsFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "settings.json");
+  const settingsFile = path.join(claudeProfileDir, "settings.json");
   const settings = JSON.parse(readFileSync(settingsFile, "utf8"));
-  assert.equal(settings.env.ANTHROPIC_MODEL, "Provider/model");
+  assert.equal(settings.apiKeyHelper, undefined);
+  assert.equal(settings.env.ANTHROPIC_FEDERATION_RULE_ID, "ccr-local");
+  assert.equal(settings.env.ANTHROPIC_ORGANIZATION_ID, "ccr-local");
+  assert.equal(settings.env.ANTHROPIC_IDENTITY_TOKEN_FILE, wifTokenFile);
+  assert.equal(settings.env.NO_PROXY, "127.0.0.1,localhost,::1");
+  assert.equal(settings.env.no_proxy, "127.0.0.1,localhost,::1");
+  assert.equal(settings.env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT, "1");
+  assert.equal(settings.env.ANTHROPIC_MODEL, "Provider/long[1m]");
+  assert.equal(settings.env.CCR_CLAUDE_CODE_MODEL, "Provider/long[1m]");
+  assert.equal(settings.env.CODEXL_CLAUDE_CODE_MODEL, "Provider/long[1m]");
   assert.equal(settings.env.ANTHROPIC_DEFAULT_FABLE_MODEL, "Provider/fable");
   assert.equal(settings.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "Provider/opus");
   assert.equal(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "Provider/sonnet");
   assert.equal(settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "Provider/haiku");
   assert.equal(settings.env.ANTHROPIC_SMALL_FAST_MODEL, undefined);
+  assert.equal(settings.env.CLAUDE_CODE_USE_GATEWAY, undefined);
+  assert.equal(settings.env.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(settings.env.ANTHROPIC_API_KEY, undefined);
+  assert.match(wrapperContent, /NO_PROXY.*127\.0\.0\.1,localhost,::1/);
+  assert.match(wrapperContent, /CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT.*1/);
+  assert.equal(settings.modelOverrides, undefined);
+  const claudeGlobalConfig = JSON.parse(readFileSync(path.join(claudeProfileDir, ".claude.json"), "utf8"));
+  assert.equal(claudeGlobalConfig.firstStartTime, "2026-01-01T00:00:00.000Z");
+  assert.equal(claudeGlobalConfig.autoCompactWindowsCache["Provider/model"], 258400);
+  assert.equal(claudeGlobalConfig.autoCompactWindowsCache["provider/model"], 258400);
+  assert.equal(claudeGlobalConfig.autoCompactWindowsCache["Provider/long"], 1_000_000);
+  assert.equal(claudeGlobalConfig.autoCompactWindowsCache["Provider/long[1m]"], 1_000_000);
+  assert.equal(claudeGlobalConfig.modelOverrides, undefined);
   const backupEntries = readdirSync(binDir).filter((entry) =>
     (
       entry.startsWith(`ccr-claude-code-api-key-${profileId}`) ||
+      entry.startsWith(`ccr-claude-code-wif-token-${profileId}`) ||
       entry.startsWith(`ccr-claude-code-wrapper-${profileId}`) ||
       entry.startsWith("ccr-codex-cli-middleware.js") ||
       entry.startsWith("toolhub-mcp.js")
     ) && entry.includes(".ccr-")
   );
   assert.deepEqual(backupEntries, []);
+});
+
+test("profile service refreshes CCR-managed global Claude gateway env for generated profiles", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ccr-generated-claude-global-env-"));
+  const previousHome = process.env.HOME;
+  const takeoverFile = path.join(CONFIGDIR, "global-profile-takeover.json");
+  try {
+    process.env.HOME = home;
+    rmSync(takeoverFile, { force: true });
+    const settingsFile = path.join(home, ".claude", "settings.json");
+    mkdirSync(path.dirname(settingsFile), { recursive: true });
+    writeFileSync(settingsFile, `${JSON.stringify({
+      alwaysThinkingEnabled: true,
+      env: {
+        ANTHROPIC_API_BASE_URL: "http://127.0.0.1:3456",
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:3456",
+        ANTHROPIC_FEDERATION_RULE_ID: "ccr-local",
+        ANTHROPIC_ORGANIZATION_ID: "ccr-local",
+        CLAUDE_AGENT_API_BASE_URL: "http://127.0.0.1:3456",
+        USER_VALUE: "kept"
+      }
+    }, null, 2)}\n`);
+
+    const config = createDefaultAppConfig();
+    config.APIKEY = "ccr-generated-global-env-test";
+    config.APIKEYS = [{
+      createdAt: "2026-01-01T00:00:00.000Z",
+      id: "profile:generated-global-env-test",
+      key: "ccr-generated-global-env-test",
+      name: "Profile: Generated Global Env Test"
+    }];
+    config.Providers = [{
+      api_base_url: "https://example.test/v1",
+      api_key: "provider-key",
+      models: ["model"],
+      name: "Provider"
+    }];
+    config.profile.profiles = [{
+      agent: "claude-code",
+      enabled: true,
+      env: {
+        CCR_CLAUDE_CODE_AUTH_MODE: "wif"
+      },
+      id: "generated-global-env-test",
+      model: "Provider/model",
+      name: "Generated Global Env Test",
+      scope: "ccr",
+      settingsFile: "~/.claude/settings.json",
+      smallFastModel: "",
+      surface: "auto"
+    }];
+
+    const result = await applyProfileFixture(config);
+    assert.equal(result.clients.some((client) => client.client === "claude-code" && client.ok), true);
+    const settings = JSON.parse(readFileSync(settingsFile, "utf8"));
+    assert.equal(settings.alwaysThinkingEnabled, true);
+    assert.equal(settings.env.USER_VALUE, "kept");
+    assert.equal(settings.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:3456");
+    assert.equal(settings.env.ANTHROPIC_API_BASE_URL, "http://127.0.0.1:3456");
+    assert.equal(settings.env.CLAUDE_AGENT_API_BASE_URL, "http://127.0.0.1:3456");
+    assert.equal(settings.env.NO_PROXY, "127.0.0.1,localhost,::1");
+    assert.equal(settings.env.no_proxy, "127.0.0.1,localhost,::1");
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT, "1");
+  } finally {
+    restoreGlobalProfileConfigsOnExit([], { manageMarker: true });
+    rmSync(takeoverFile, { force: true });
+    rmSync(home, { force: true, recursive: true });
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+  }
+});
+
+test("#1779 profile service defaults to apiKeyHelper even on Claude Code 2.1.235", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "ccr-claude-auth-mode-"));
+  const profileId = "old-claude-code";
+  const commandExtension = process.platform === "win32" ? ".cmd" : "";
+  const wifTokenExtension = process.platform === "win32" ? ".txt" : "";
+  try {
+    const binDir = path.join(CONFIGDIR, "bin");
+    const fakeClaude = path.join(root, process.platform === "win32" ? "claude.cmd" : "claude");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(fakeClaude, process.platform === "win32"
+      ? "@echo off\r\necho 2.1.235\r\n"
+      : "#!/bin/sh\nprintf '%s\\n' '2.1.235'\n");
+    chmodSync(fakeClaude, 0o700);
+
+    const config = createDefaultAppConfig();
+    config.APIKEY = "ccr-old-auto-token";
+    config.APIKEYS = [{
+      createdAt: "2026-01-01T00:00:00.000Z",
+      id: `profile:${profileId}`,
+      key: "ccr-old-auto-token",
+      name: "Profile: Old Claude Code"
+    }];
+    config.Providers = [{
+      api_base_url: "https://example.test/v1",
+      api_key: "provider-key",
+      models: ["model"],
+      name: "Provider"
+    }];
+    config.profile.profiles = [{
+      agent: "claude-code",
+      enabled: true,
+      env: {
+        CCR_CLAUDE_CODE_BIN: fakeClaude
+      },
+      id: profileId,
+      model: "Provider/model",
+      name: "Old Claude Code",
+      scope: "ccr",
+      settingsFile: "~/.claude/settings.json",
+      smallFastModel: "",
+      surface: "auto"
+    }];
+
+    const result = await applyProfileFixture(config);
+    assert.equal(result.clients.length, 1);
+    assert.equal(result.clients[0].ok, true);
+
+    const helperFile = path.join(binDir, `ccr-claude-code-api-key-${profileId}${commandExtension}`);
+    const tokenFile = path.join(binDir, `ccr-claude-code-wif-token-${profileId}${wifTokenExtension}`);
+    const settingsFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsFile, "utf8"));
+    assert.equal(settings.apiKeyHelper, process.platform === "win32" ? `"${helperFile}"` : helperFile);
+    assert.equal(settings.env.ANTHROPIC_IDENTITY_TOKEN_FILE, undefined);
+    assert.equal(settings.env.ANTHROPIC_FEDERATION_RULE_ID, undefined);
+    assert.equal(settings.env.CCR_CLAUDE_CODE_AUTH_MODE, undefined);
+    assert.equal(readFileSync(tokenFile, "utf8"), "ccr-old-auto-token\n");
+    assert.match(readFileSync(helperFile, "utf8"), /ccr-old-auto-token/);
+    if (process.platform !== "win32") {
+      const helper = spawnSync(helperFile, [], { encoding: "utf8" });
+      assert.equal(helper.status, 0);
+      assert.equal(helper.stdout.trim(), "ccr-old-auto-token");
+    }
+
+    const wrapperContent = readFileSync(path.join(binDir, `ccr-claude-code-wrapper-${profileId}${commandExtension}`), "utf8");
+    assert.equal(wrapperContent.includes("ANTHROPIC_IDENTITY_TOKEN_FILE"), false);
+    assert.equal(wrapperContent.includes("CCR_REMOTE_SYNC_API_KEY_FILE"), true);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("#1798 profile service removes boolean autoMode when apiKeyHelper manages authentication", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const profileId = "claude-auto-mode-api-key-helper";
+  const config = createDefaultAppConfig();
+  config.APIKEY = "ccr-auto-mode-api-key-helper-test";
+  config.APIKEYS = [{
+    createdAt: "2026-01-01T00:00:00.000Z",
+    id: `profile:${profileId}`,
+    key: "ccr-auto-mode-api-key-helper-test",
+    name: "Profile: Claude Auto Mode API Key Helper Test"
+  }];
+  config.Providers = [{
+    api_base_url: "https://example.test/v1",
+    api_key: "provider-key",
+    models: ["model"],
+    name: "Provider"
+  }];
+  config.profile.profiles = [{
+    agent: "claude-code",
+    claudeSettings: {
+      autoCompactEnabled: true,
+      autoMemoryEnabled: true,
+      autoMode: true
+    },
+    enabled: true,
+    env: {},
+    id: profileId,
+    model: "Provider/model",
+    name: "Claude Auto Mode API Key Helper",
+    scope: "ccr",
+    settingsFile: "~/.claude/settings.json",
+    smallFastModel: "",
+    surface: "auto"
+  }];
+
+  await applyProfileFixture(config);
+  const settingsFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "settings.json");
+  const firstSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  assert.equal(firstSettings.autoMode, undefined, "persisted boolean autoMode must not override helper auth");
+  assert.equal(firstSettings.autoMemoryEnabled, true);
+  assert.equal(firstSettings.autoCompactEnabled, true);
+  assert.match(firstSettings.apiKeyHelper, /ccr-claude-code-api-key-/);
+
+  writeFileSync(settingsFile, `${JSON.stringify({ ...firstSettings, autoMode: true }, null, 2)}\n`);
+  await applyProfileFixture(config);
+  const secondSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  assert.equal(secondSettings.autoMode, undefined, "a session-written boolean autoMode must be removed on the next apply");
+  assert.match(secondSettings.apiKeyHelper, /ccr-claude-code-api-key-/);
+
+  config.profile.profiles[0].claudeSettings.autoMode = { classifyAllShell: true };
+  await applyProfileFixture(config);
+  const structuredSettings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  assert.deepEqual(structuredSettings.autoMode, { classifyAllShell: true });
 });
 
 test("Codex profile launcher bypasses middleware for Browser and Computer Use helpers", { skip: process.platform === "win32" || !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
@@ -614,7 +979,7 @@ test("Codex profile launcher bypasses middleware for Browser and Computer Use he
       surface: "app"
     }];
 
-    const applied = await applyProfileConfig(config);
+    const applied = await applyProfileFixture(config);
     assert.equal(applied.clients[0].ok, true);
     const launcher = path.join(CONFIGDIR, "bin", `ccr-codex-cli-stdio-${profileId}`);
     const content = readFileSync(launcher, "utf8");
@@ -712,7 +1077,7 @@ test("profile service injects ToolHub MCP into Codex config", { skip: !process.e
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].ok, true);
 
@@ -766,7 +1131,7 @@ test("profile service injects ToolHub MCP into Codex config", { skip: !process.e
       ].join("\n"))
   );
 
-  await applyProfileConfig(config);
+  await applyProfileFixture(config);
 
   const preservedConfig = readFileSync(configFile, "utf8");
   assert.match(preservedConfig, /model = "User\/selected-in-codex"/);
@@ -784,7 +1149,7 @@ test("profile service injects ToolHub MCP into Codex config", { skip: !process.e
 
   config.Providers[0].models.push("model-2");
   config.profile.profiles[0].model = "Provider/model-2";
-  await applyProfileConfig(config);
+  await applyProfileFixture(config);
 
   const explicitlyUpdatedConfig = readFileSync(configFile, "utf8");
   assert.match(explicitlyUpdatedConfig, /model = "Provider\/model-2"/);
@@ -836,7 +1201,7 @@ test("profile service injects Context Archive MCP for managed Claude Code profil
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].ok, true);
   const mcpConfigFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "toolhub-mcp.json");
@@ -894,7 +1259,7 @@ test("profile service injects Context Archive MCP for managed Codex profile", { 
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].ok, true);
 
@@ -950,7 +1315,7 @@ test("profile service injects Context Archive MCP for managed Claude Code withou
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].ok, true);
   const mcpConfigFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "toolhub-mcp.json");
@@ -962,7 +1327,7 @@ test("profile service injects Context Archive MCP for managed Claude Code withou
 
 test("profile service writes a Grok CLI wrapper that points model discovery and inference to CCR", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
   const profileId = "grok-gateway-test";
-  const sourceGrokHome = path.join(process.env.HOME, ".grok");
+  const sourceGrokHome = path.join(process.env.CCR_INTERNAL_HOME_DIR, ".grok");
   mkdirSync(path.join(sourceGrokHome, "sessions"), { recursive: true });
   mkdirSync(path.join(sourceGrokHome, "skills"), { recursive: true });
   writeFileSync(path.join(sourceGrokHome, "auth.json"), "oauth credentials must not be shared");
@@ -998,7 +1363,7 @@ test("profile service writes a Grok CLI wrapper that points model discovery and 
       enabled: true,
       env: {
         CCR_GROK_BIN: "/custom/bin/grok",
-        GROK_HOME: "~/.grok",
+        GROK_HOME: sourceGrokHome,
         GROK_MODELS_BASE_URL: "https://ignored.example/v1",
         USER_VALUE: "kept"
       },
@@ -1010,7 +1375,7 @@ test("profile service writes a Grok CLI wrapper that points model discovery and 
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].client, "grok");
   assert.equal(result.clients[0].ok, true);
@@ -1089,12 +1454,18 @@ test("profile service writes a multi-model Kimi CLI home that points inference t
     {
       api_base_url: "https://api.deepseek.com",
       api_key: "deepseek-key",
+      modelMetadata: { "deepseek-v4-flash": { capabilities: { imageInput: false } } },
       models: ["deepseek-v4-flash"],
       name: "DeepSeek"
     },
     {
       api_base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
       api_key: "zhipu-key",
+      modelMetadata: { "glm-5.2": {
+        capabilities: { imageInput: true },
+        contextWindow: 1049000,
+        supportsReasoningSummaries: true
+      } },
       models: ["glm-5.2"],
       name: "Zhipu Coding"
     }
@@ -1133,7 +1504,7 @@ test("profile service writes a multi-model Kimi CLI home that points inference t
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].client, "kimi");
   assert.equal(result.clients[0].ok, true);
@@ -1169,18 +1540,18 @@ test("profile service writes a multi-model Kimi CLI home that points inference t
 
   delete config.profile.profiles[0].availableModels;
   config.profile.profiles[0].model = "";
-  const legacyResult = await applyProfileConfig(config);
+  const legacyResult = await applyProfileFixture(config);
   assert.equal(legacyResult.clients[0].ok, true);
   const legacyProfileConfigContent = readFileSync(path.join(profileKimiHome, "config.toml"), "utf8");
   assert.match(legacyProfileConfigContent, /default_model = "Provider\/model"/);
   assert.match(legacyProfileConfigContent, /\[models\."Provider\/model"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Provider\/fast"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Provider\/gpt-5\.6-sol"\]\nprovider = "claude-code-router"\nmodel = "Provider\/gpt-5\.6-sol"\nmax_context_size = 1050000\ncapabilities = \["tool_use", "image_in", "thinking"\]/);
-  assert.match(legacyProfileConfigContent, /\[models\."Provider\/gpt-5\.5-pro"\][\s\S]*?capabilities = \["tool_use", "image_in", "always_thinking"\]/);
+  assert.match(legacyProfileConfigContent, /\[models\."Provider\/gpt-5\.5-pro"\][\s\S]*?capabilities = \["tool_use", "image_in", "thinking"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Provider\/legacy-extra"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Custom Gemini\/gemini-2\.5-pro"\]\nprovider = "claude-code-router"\nmodel = "Custom Gemini\/gemini-2\.5-pro"\nmax_context_size = 1065535/);
   assert.match(legacyProfileConfigContent, /\[models\."DeepSeek\/deepseek-v4-flash"\]\nprovider = "claude-code-router"\nmodel = "DeepSeek\/deepseek-v4-flash"\nmax_context_size = 1050000\ncapabilities = \["tool_use", "thinking"\]/);
-  assert.match(legacyProfileConfigContent, /\[models\."Zhipu Coding\/glm-5\.2"\]\nprovider = "claude-code-router"\nmodel = "Zhipu Coding\/glm-5\.2"\nmax_context_size = 1049000\ncapabilities = \["tool_use", "thinking"\]/);
+  assert.match(legacyProfileConfigContent, /\[models\."Zhipu Coding\/glm-5\.2"\]\nprovider = "claude-code-router"\nmodel = "Zhipu Coding\/glm-5\.2"\nmax_context_size = 1049000\ncapabilities = \["tool_use", "image_in", "thinking"\]/);
   assert.match(legacyProfileConfigContent, /\[models\."Fusion\/catalog-context"\]\nprovider = "claude-code-router"\nmodel = "Fusion\/catalog-context"\nmax_context_size = 1050000\ncapabilities = \["tool_use", "image_in", "thinking"\]/);
 });
 
@@ -1226,7 +1597,7 @@ test("profile service writes a Pi config and wrapper that points inference to CC
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].client, "pi");
   assert.equal(result.clients[0].ok, true);
@@ -1259,6 +1630,23 @@ test("profile service writes a Pi config and wrapper that points inference to CC
   assert.ok(provider.models.some((model) => model.id === "Provider/model"));
   assert.ok(provider.models.some((model) => model.id === "Provider/fast"));
   assert.equal(existsSync(path.join(profilePiHome, "sessions")), true);
+});
+
+test("#1851 Windows Pi wrapper uses the argument-aware CLI runtime", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const config = createDefaultAppConfig();
+  config.Providers = [{ name: "Provider", models: ["model"], type: "openai_chat_completions", api_base_url: "https://example.test/v1" }];
+  config.APIKEYS = [{ id: "profile:pi-dispatch", key: "test", name: "Pi" }];
+  config.profile.profiles = [{ agent: "pi", enabled: true, env: {}, id: "pi-dispatch", model: "Provider/model", name: "Pi", scope: "ccr", surface: "cli" }];
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    const result = await applyProfileFixture(config);
+    assert.equal(result.clients[0].ok, true);
+    const content = readFileSync(path.join(CONFIGDIR, "bin", "ccr-pi-wrapper-pi-dispatch.cmd"), "utf8");
+    assert.match(content, /CCR_PI_WRAPPER=1/);
+    assert.match(content, /ccr-codex-cli-middleware\.js/);
+    assert.doesNotMatch(content, /"pi" --provider .*%\*/);
+  } finally { Object.defineProperty(process, "platform", originalPlatform); }
 });
 
 test("profile service writes an OpenCode CLI wrapper and shared CLI/App config", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
@@ -1301,7 +1689,7 @@ test("profile service writes an OpenCode CLI wrapper and shared CLI/App config",
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].client, "opencode");
   assert.equal(result.clients[0].ok, true);
@@ -1366,21 +1754,21 @@ test("profile service removes disabled and deleted OpenCode wrappers and API key
   const commandExtension = process.platform === "win32" ? ".cmd" : "";
   const wrapperFile = path.join(CONFIGDIR, "bin", `ccr-opencode-wrapper-${profileId}${commandExtension}`);
 
-  await applyProfileConfig(config);
+  await applyProfileFixture(config);
   assert.equal(existsSync(wrapperFile), true);
 
   profile.enabled = false;
-  await applyProfileConfig(config);
+  await applyProfileFixture(config);
   assert.equal(existsSync(wrapperFile), false);
   assert.deepEqual(config.APIKEYS.map((apiKey) => apiKey.id), ["general-key"]);
 
   profile.enabled = true;
-  await applyProfileConfig(config);
+  await applyProfileFixture(config);
   assert.equal(existsSync(wrapperFile), true);
   assert.ok(config.APIKEYS.some((apiKey) => apiKey.id === `profile:${profileId}`));
 
   config.profile.profiles = [];
-  await applyProfileConfig(config);
+  await applyProfileFixture(config);
   assert.equal(existsSync(wrapperFile), false);
   assert.deepEqual(config.APIKEYS.map((apiKey) => apiKey.id), ["general-key"]);
 });
@@ -1442,7 +1830,7 @@ test("profile service clears stale Claude Code ToolHub artifacts when no gateway
     }
   ];
 
-  const result = await applyProfileConfig(config);
+  const result = await applyProfileFixture(config);
   assert.equal(result.clients.length, 1);
   assert.equal(result.clients[0].ok, false);
   assert.equal(existsSync(toolHubMcpConfigFile), false);
@@ -1665,3 +2053,141 @@ test("profile service restores global agent configs on exit", () => {
     rmSync(root, { force: true, recursive: true });
   }
 });
+
+test("profile service invalidates Claude gateway model discovery cache only when the discovery payload changes", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const profileId = "claude-model-discovery-cache";
+  const settingsFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "settings.json");
+  const gatewayCacheFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "cache", "gateway-models.json");
+  const fingerprintFile = path.join(CONFIGDIR, "claude-model-discovery-fingerprint.json");
+  rmSync(fingerprintFile, { force: true });
+
+  const config = createDefaultAppConfig();
+  config.Providers = [
+    {
+      api_base_url: "https://example.test/v1",
+      api_key: "provider-key",
+      models: ["alpha", "beta"],
+      name: "Provider"
+    }
+  ];
+  config.preferredProvider = "Provider";
+  config.APIKEY = "ccr-claude-model-discovery-cache-test";
+  config.APIKEYS = [
+    {
+      createdAt: "2026-01-01T00:00:00.000Z",
+      id: `profile:${profileId}`,
+      key: "ccr-claude-model-discovery-cache-test",
+      name: "Profile: Claude Model Discovery Cache Test"
+    }
+  ];
+  config.profile.profiles = [
+    {
+      agent: "claude-code",
+      availableModels: ["Provider/alpha"],
+      enabled: true,
+      env: {},
+      id: profileId,
+      model: "Provider/alpha",
+      name: "Claude Code",
+      scope: "ccr",
+      settingsFile,
+      smallFastModel: "",
+      surface: "cli"
+    }
+  ];
+
+  mkdirSync(path.dirname(gatewayCacheFile), { recursive: true });
+  writeFileSync(gatewayCacheFile, `{"baseUrl":"http://127.0.0.1:${config.gateway.port}","fetchedAt":1,"models":[]}`);
+
+  await applyProfileFixture(config);
+  assert.equal(existsSync(gatewayCacheFile), false);
+
+  writeFileSync(gatewayCacheFile, "{}");
+  await applyProfileFixture(config);
+  assert.equal(existsSync(gatewayCacheFile), true, "unchanged allowlist must not invalidate the cache");
+
+  config.Providers[0].modelMetadata = { alpha: { contextWindow: 400000 } };
+  await applyProfileFixture(config);
+  assert.equal(existsSync(gatewayCacheFile), false, "model metadata change must invalidate the cache even with an unchanged allowlist");
+
+  writeFileSync(gatewayCacheFile, "{}");
+  config.profile.profiles[0].availableModels = ["Provider/alpha", "Provider/beta"];
+  await applyProfileFixture(config);
+  assert.equal(existsSync(gatewayCacheFile), false, "allowlist change must invalidate the cache");
+
+  rmSync(fingerprintFile, { force: true });
+});
+
+test("profile service reports a failed model discovery cache invalidation without aborting the remaining profiles", { skip: !process.env.CCR_INTERNAL_HOME_DIR }, async () => {
+  const profileId = "claude-model-discovery-cache-failure";
+  const followingProfileId = "codex-after-claude-failure";
+  const settingsFile = path.join(CONFIGDIR, "profiles", profileId, "claude", "settings.json");
+  const codexConfigFile = path.join(CONFIGDIR, "profiles", followingProfileId, "codex", "config.toml");
+  const fingerprintFile = path.join(CONFIGDIR, "claude-model-discovery-fingerprint.json");
+  rmSync(fingerprintFile, { force: true, recursive: true });
+  mkdirSync(fingerprintFile, { recursive: true });
+
+  const config = createDefaultAppConfig();
+  config.Providers = [
+    {
+      api_base_url: "https://example.test/v1",
+      api_key: "provider-key",
+      models: ["alpha"],
+      name: "Provider"
+    }
+  ];
+  config.preferredProvider = "Provider";
+  config.APIKEY = "ccr-claude-model-discovery-cache-failure-test";
+  config.APIKEYS = [
+    {
+      createdAt: "2026-01-01T00:00:00.000Z",
+      id: `profile:${profileId}`,
+      key: "ccr-claude-model-discovery-cache-failure-test",
+      name: "Profile: Claude Model Discovery Cache Failure Test"
+    }
+  ];
+  config.profile.profiles = [
+    {
+      agent: "claude-code",
+      availableModels: ["Provider/alpha"],
+      enabled: true,
+      env: {},
+      id: profileId,
+      model: "Provider/alpha",
+      name: "Claude Code",
+      scope: "ccr",
+      settingsFile,
+      smallFastModel: "",
+      surface: "cli"
+    },
+    {
+      agent: "codex",
+      availableModels: ["Provider/alpha"],
+      configFile: codexConfigFile,
+      enabled: true,
+      env: {},
+      id: followingProfileId,
+      model: "Provider/alpha",
+      name: "Codex",
+      scope: "ccr",
+      smallFastModel: "",
+      surface: "cli"
+    }
+  ];
+
+  try {
+    const result = await applyProfileFixture(config);
+    const claudeStatus = result.clients.find((client) => client.client === "claude-code");
+    assert.equal(claudeStatus?.ok, false, "a failed cache invalidation must be reported as a contained Claude Code error");
+    assert.ok(result.clients.some((client) => client.client === "codex"), "profiles after the failing one must still be applied");
+  } finally {
+    rmSync(fingerprintFile, { force: true, recursive: true });
+  }
+});
+
+// Profile application reads credentials from their authoritative store. Persist
+// each fixture explicitly; config snapshots are no longer credential updates.
+async function applyProfileFixture(config, options) {
+  await replacePersistedApiKeys(config.APIKEYS ?? []);
+  return applyProfileConfig(config, options);
+}

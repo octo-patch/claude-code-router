@@ -16,14 +16,18 @@ import { isLocalClaudeCodeOauthProviderPlugin, mergeAnthropicBetaValues } from "
 import { abortSignalMessage, formatError, omitLocalObservabilityHeaders, shouldSendBody, withCoreGatewayAuthHeader } from "@ccr/core/gateway/http/io";
 import { parseJsonObjectSafe, releaseJsonObject, serializeJsonBody, serializeJsonBodyWithModel } from "@ccr/core/gateway/http/body";
 import { resolveGatewayPublicModelId } from "@ccr/core/gateway/features/model-discovery";
+import { ccrRoutedModelHeader } from "@ccr/core/gateway/core-runtime/router-plugin-contract";
 import { activeProviderCredentials, findProviderByPublicOrInternalName, findProviderCredentialBySlug, normalizedProviderCapabilities, parseProviderCredentialInternalName, providerCapabilityForClientProtocol, providerCapabilityInternalName, providerCapabilityNameMatches, providerCredentialInternalName, providerCredentialPriority, providerCredentialRuntimeId, providerCredentialSlug, providerProtocolForClientProtocol, sanitizeHeaderValue } from "@ccr/core/providers/runtime-topology";
 import { delay } from "@ccr/core/gateway/internal/clock";
 import { retryDelayAfterNetworkError, retryDelayAfterStatus, shouldFallbackAfterStatus } from "@ccr/core/gateway/upstream/retry-policy";
 import { claudeCodeOauthBetaHeader, claudeCodeOauthRequiredBeta, UpstreamRequestError } from "@ccr/core/gateway/internal/shared";
 import type { ApiKeyLimitUsage, ProviderCredentialRoutingTarget, UpstreamAttempt, UpstreamFailedAttempt, UpstreamFetchResult } from "@ccr/core/gateway/internal/shared";
 import type { RouteTraceObserver } from "@ccr/core/observability/route-trace";
+import { monotonicNowMs } from "@ccr/core/observability/stream-experience";
 
 const providerCredentialSpilloverThreshold = 0.8;
+const openRouterDiscountModelHeader = "x-ccr-openrouter-discount-model";
+const openRouterDiscountProviderHeader = "x-ccr-openrouter-discount-provider-id";
 
 
 export function applyProviderCapabilityRouting(input: {
@@ -276,6 +280,14 @@ export function rewriteCapabilityResponseHeaders(headers: Headers, config: AppCo
 }
 
 
+function routedModelHeaderForAttempt(attempt: UpstreamAttempt): string | undefined {
+  if (attempt.target?.kind === "provider") {
+    const provider = firstTargetProviderHeader(attempt.headers ?? {}) ?? providerRuntimeId(attempt.target.provider);
+    return `${provider}/${attempt.target.model}`;
+  }
+  return attempt.target?.canonicalSelector ?? normalizeRouteSelector(attempt.model);
+}
+
 export async function fetchUpstreamWithFallback(input: {
   body?: Buffer;
   config: AppConfig;
@@ -355,7 +367,10 @@ export async function fetchUpstreamWithFallback(input: {
     let cachedAttemptRouting = attemptRoutingCache.get(plannedAttempt.model);
     if (!cachedAttemptRouting) {
       const routedHeaders = { ...input.headers };
-      const sourceBody = buildAttemptBody(input.body, input.path, plannedAttempt.model);
+      const sourceBody = buildAttemptBody(input.body, input.path, plannedAttempt.model, {
+        discountModel: input.headers[openRouterDiscountModelHeader],
+        discountProvider: input.headers[openRouterDiscountProviderHeader]
+      });
       const routing = applyProviderCapabilityRouting({
         body: sourceBody,
         config: input.config,
@@ -410,6 +425,16 @@ export async function fetchUpstreamWithFallback(input: {
       method: input.method,
       path: input.path
     });
+    if (index > 0) {
+      const headers = { ...attempt.headers };
+      const attemptRoutedModel = routedModelHeaderForAttempt(attempt);
+      if (attemptRoutedModel) {
+        headers[ccrRoutedModelHeader] = sanitizeHeaderValue(attemptRoutedModel);
+      } else {
+        delete headers[ccrRoutedModelHeader];
+      }
+      attempt.headers = headers;
+    }
     const hasNextAttempt = index < attempts.length - 1;
     const attemptUrl = rewriteRouteModelInUrl(input.upstreamUrl, attempt.model);
     const upstreamHeaders = {
@@ -426,6 +451,7 @@ export async function fetchUpstreamWithFallback(input: {
       attempt.target?.kind === "provider" ? attempt.target.provider.name : undefined
     );
     const attemptStartedAt = Date.now();
+    const attemptStartedAtMonoMs = monotonicNowMs();
     input.trace?.capture({
       attempt: attemptNumber,
       changes: [
@@ -441,8 +467,9 @@ export async function fetchUpstreamWithFallback(input: {
           : []),
         ...(attemptUrl !== input.upstreamUrl
           ? [{ after: attemptUrl, before: input.upstreamUrl, operation: "replace" as const, path: "/url", scope: "url" as const }]
-          : [])
-      ],
+          : []),
+        routeTraceChange("headers", `/headers/${ccrRoutedModelHeader}`, input.headers[ccrRoutedModelHeader], attempt.headers?.[ccrRoutedModelHeader])
+      ].filter(isRouteTraceChange),
       durationMs: attemptStartedAt - attemptPreparationStartedAt,
       kind: "attempt",
       name: "upstream.attempt.prepare",
@@ -497,7 +524,9 @@ export async function fetchUpstreamWithFallback(input: {
           statusCode: response.status
         });
         recordProviderCredentialOutcome(input.config, input.method, attempt, response.status, response.headers);
-        await drainResponseBody(response);
+        // Failed response bodies may never finish. Start cancellation without
+        // waiting for upstream cleanup before trying the next provider.
+        void cancelResponseBody(response);
         if (delayMs > 0) {
           await delay(delayMs, input.signal);
         }
@@ -522,7 +551,10 @@ export async function fetchUpstreamWithFallback(input: {
       return {
         attempt,
         failedAttempts,
-        response
+        response,
+        timing: {
+          attemptStartedAtMonoMs
+        }
       };
     } catch (error) {
       const message = formatError(error);
@@ -610,12 +642,19 @@ function prepareUpstreamCredentialAttempt(input: {
   const credentials = activeProviderCredentials(target.provider);
   if (credentials.length === 0) {
     const preserveModelSelector = shouldPreserveCapabilityModelSelector(input.attempt.body, target);
+    const targetHeaders = targetProviderFallbackHeaders(attemptHeaders, target.provider, target.protocol);
+    const targetBody = target.body ?? normalizedBody?.body ?? input.attempt.body;
+    const providerQualifiedTargetBody = providerQualifiedTargetModelBody(
+      targetBody,
+      target.model,
+      targetHeaders["x-target-provider"]
+    );
     return {
       ...input.attempt,
-      body: attemptBody(preserveModelSelector ? input.attempt.body : target.body ?? normalizedBody?.body ?? input.attempt.body),
+      body: attemptBody(preserveModelSelector ? input.attempt.body : providerQualifiedTargetBody ?? targetBody),
       headers: preserveModelSelector
         ? clearTargetProviderHeaders(attemptHeaders)
-        : targetProviderFallbackHeaders(attemptHeaders, target.provider, target.protocol)
+        : targetHeaders
     };
   }
 
@@ -732,6 +771,22 @@ function shouldPreserveCapabilityModelSelector(body: Buffer | undefined, target:
 }
 
 
+function providerQualifiedTargetModelBody(
+  body: Buffer | undefined,
+  model: string | undefined,
+  providerSelector: string | undefined
+): Buffer | undefined {
+  if (!model || !providerSelector || !parseProviderModelSelector(model)) {
+    return undefined;
+  }
+  const parsedBody = parseJsonObjectSafe(body);
+  if (!parsedBody) {
+    return undefined;
+  }
+  return serializeJsonBodyWithModel(parsedBody, `${providerSelector}/${model}`);
+}
+
+
 function resolvePlannedProviderCredentialRoutingTarget(
   attempt: UpstreamAttempt,
   path: string
@@ -780,6 +835,9 @@ function usageAwareOpenAiChatAttemptBody(input: {
       : undefined
   );
   if (providerProtocol !== "openai_chat_completions" && providerProtocol !== "openai_responses") {
+    return input.body;
+  }
+  if (providerProtocol === "openai_responses" && clientProtocol === "openai_responses") {
     return input.body;
   }
   const sanitizedBody = stripUnsupportedOpenAiRequestParameters(input.body);
@@ -1050,7 +1108,11 @@ function buildUpstreamAttempts(
 function buildAttemptBody(
   body: Buffer | undefined,
   path: string,
-  model: string | undefined
+  model: string | undefined,
+  options: {
+    discountModel?: string;
+    discountProvider?: string;
+  } = {}
 ): Buffer | undefined {
   if (!body || !model || requestProtocolForPath(path) === "gemini_generate_content") {
     return body;
@@ -1059,7 +1121,52 @@ function buildAttemptBody(
   if (!parsedBody || stringValue(parsedBody.model) === model) {
     return body;
   }
+  if (shouldRemoveOpenRouterDiscountProvider(parsedBody, model, options)) {
+    const { provider: _provider, ...rest } = parsedBody;
+    return serializeJsonBody({ ...rest, model });
+  }
   return serializeJsonBodyWithModel(parsedBody, model);
+}
+
+function shouldRemoveOpenRouterDiscountProvider(
+  body: Record<string, unknown>,
+  model: string,
+  options: {
+    discountModel?: string;
+    discountProvider?: string;
+  }
+): boolean {
+  if (!options.discountModel || !isRecord(body.provider)) {
+    return false;
+  }
+  return !selectorMatchesOpenRouterDiscountTarget(model, options.discountModel, options.discountProvider);
+}
+
+function selectorMatchesOpenRouterDiscountTarget(
+  model: string,
+  discountModel: string,
+  discountProvider: string | undefined
+): boolean {
+  const normalizedModel = normalizeRouteSelector(model)?.toLowerCase() ?? "";
+  const normalizedDiscountModel = normalizeRouteSelector(discountModel)?.toLowerCase() ?? "";
+  if (!normalizedModel || !normalizedDiscountModel) {
+    return false;
+  }
+  if (normalizedModel === normalizedDiscountModel) {
+    return true;
+  }
+  if (!normalizedModel.endsWith(`/${normalizedDiscountModel}`)) {
+    return false;
+  }
+  const providerPrefix = normalizedModel.slice(0, normalizedModel.length - normalizedDiscountModel.length - 1);
+  const providerKey = normalizeProviderHint(discountProvider);
+  const normalizedProviderPrefix = normalizeProviderHint(providerPrefix);
+  return normalizedProviderPrefix.includes("openrouter") ||
+    Boolean(providerKey && normalizedProviderPrefix.includes(providerKey));
+}
+
+function normalizeProviderHint(value: unknown): string {
+  return (stringValue(value) ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
 
@@ -1087,20 +1194,11 @@ function isRouteTraceChange(value: RequestRouteTraceChange | undefined): value i
 }
 
 
-async function drainResponseBody(response: Response): Promise<void> {
-  try {
-    await response.arrayBuffer();
-  } catch {
-    // The failed attempt is already being skipped; body drain errors should not block the next attempt.
-  }
-}
-
-
 export async function cancelResponseBody(response: Response): Promise<void> {
   try {
     await response.body?.cancel();
   } catch {
-    // The client already disconnected; best-effort upstream cleanup must not mask that expected path.
+    // Cleanup after a failed attempt or client disconnect must not mask the original outcome.
   }
 }
 

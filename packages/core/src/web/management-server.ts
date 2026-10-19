@@ -1,3 +1,4 @@
+import { refreshModelCatalog } from "@ccr/core/models/catalog-file";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -10,8 +11,7 @@ import { loadOnboardingFinished, markOnboardingFinished } from "@ccr/core/config
 import { scanBotHandoffBluetoothTargets, scanBotHandoffWifiTargets } from "@ccr/core/agents/bot-gateway/handoff-scan-service";
 import { cancelBotGatewayQrLogin, startBotGatewayQrLogin, waitBotGatewayQrLogin } from "@ccr/core/agents/bot-gateway/qr-login-service";
 import { syncClaudeAppGatewayConfig, restoreClaudeAppGatewayConfig } from "@ccr/core/agents/claude-app/gateway-service";
-import { findInstalledCodexAppExecutable } from "@ccr/core/agents/codex/app-launch";
-import { findInstalledOpenCodeAppExecutable } from "@ccr/core/agents/opencode/app-launch";
+import { getAppInfoPaths } from "@ccr/core/agents/app-info-paths";
 import { loadAppConfig, saveApiKeysConfig, saveAppConfig } from "@ccr/core/config/config";
 import {
   APP_CONFIG_DB_FILE,
@@ -31,17 +31,19 @@ import { detectProviderIcon } from "@ccr/core/providers/icons";
 import { fetchProviderManifest } from "@ccr/core/providers/manifest-service";
 import { getLocalAgentProviderCandidates, importLocalAgentProvider, probeLocalAgentProvider } from "@ccr/core/agents/local-providers/service";
 import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
+import { getOpenRouterProviderCatalog } from "@ccr/core/providers/openrouter-provider-catalog";
 import { getProviderPresets } from "@ccr/core/providers/presets/index";
 import { checkGatewayProviderConnectivity, probeGatewayProvider, probeGatewayProviderCandidates } from "@ccr/core/providers/probe";
+import { stopProviderModelAutoRefreshService, syncProviderModelAutoRefreshService } from "@ccr/core/providers/model-auto-refresh";
 import { applyProfileConfig } from "@ccr/core/profiles/service";
 import { getProfileOpenCommand, getProfileRuntimeStatus, openProfileFromCcr, stopProfileFromCcr } from "@ccr/core/profiles/launch-service";
 import { getPluginMarketplace } from "@ccr/core/plugins/marketplace";
 import { ensureProxyCertificateAuthority } from "@ccr/core/proxy/certificates";
 import { proxyService } from "@ccr/core/proxy/service";
 import { listMcpServerTools } from "@ccr/core/mcp/tool-discovery";
-import { closeRequestLogRuntime, getAgentAnalysis, getAgentTracePayload, getRequestLogDetail, getRequestLogs } from "@ccr/core/observability/request-log-store";
+import { closeRequestLogRuntime, getAgentAnalysis, getAgentTracePayload, getRequestLogBodyChunk, getRequestLogDetail, getRequestLogs } from "@ccr/core/observability/request-log-store";
 import { shouldRecordRequestLogs } from "@ccr/core/observability/raw-trace-sync";
-import { getUsageStats } from "@ccr/core/usage/store";
+import { getUsageStats, resetOverviewStatistics } from "@ccr/core/usage/store";
 import { gatewayService } from "@ccr/core/gateway/service";
 import { shouldRestartGatewayForRuntimeConfigChange } from "@ccr/core/gateway/runtime-change";
 import { getProviderAccountSnapshots, invalidateProviderAccountSnapshotCache, resetCodexRateLimitCredit, testProviderAccountConnector } from "@ccr/core/providers/account-service";
@@ -67,6 +69,7 @@ import type {
   GatewayStatus,
   LocalAgentProviderImportRequest,
   LocalAgentProviderProbeRequest,
+  OpenRouterProviderCatalogRequest,
   PluginDependency,
   PluginDirectorySelection,
   ProfileApplyResult,
@@ -77,6 +80,7 @@ import type {
   ProviderCatalogModelsRequest,
   ProviderIconDetectionRequest,
   ProviderManifestFetchRequest,
+  RequestLogBodyChunkRequest,
   RequestLogDetailRequest,
   RequestLogListFilter,
   RouteScriptTestRequest,
@@ -129,6 +133,7 @@ const webBridgeScriptTag = '    <script src="../../assets/web-client-bridge.js">
 
 
 export async function startWebManagementServer(options: WebManagementServerOptions = {}): Promise<WebManagementServerRuntime> {
+  await refreshModelCatalog();
   const host = options.host?.trim() || readEnvString("CCR_WEB_HOST") || defaultWebHost;
   const requestedPort = options.port ?? readEnvPort("CCR_WEB_PORT") ?? defaultWebPort;
   const authToken = options.authToken?.trim() || readEnvString("CCR_WEB_AUTH_TOKEN") || randomBytes(32).toString("base64url");
@@ -243,7 +248,7 @@ async function handleRpcRequest(request: IncomingMessage, response: ServerRespon
     const value = await handler(...(Array.isArray(payload.args) ? payload.args : []));
     sendJson(response, 200, { ok: true, value });
   } catch (error) {
-    sendJson(response, 500, { error: { message: formatError(error) }, ok: false });
+    sendJson(response, error instanceof Error && error.name === "AppConfigConflictError" ? 409 : 500, { error: { message: formatError(error) }, ok: false });
   }
 }
 
@@ -264,7 +269,17 @@ const rpcHandlers: Record<string, RpcHandler> = {
     const synced = await syncClaudeAppGatewayConfig(baseConfig);
     const savedConfig = synced.config;
     let runtimeStatus = gatewayService.getStatus();
-    if (synced.configChanged || shouldRestartGatewayForRuntimeConfigChange(previousConfig, savedConfig) || runtimeStatus.state !== "running") {
+    const restartRequired = synced.configChanged ||
+      shouldRestartGatewayForRuntimeConfigChange(previousConfig, savedConfig) ||
+      runtimeStatus.state !== "running";
+    if (runtimeStatus.gatewayManagedExternally) {
+      if (restartRequired) {
+        runtimeStatus = await gatewayService.restart(savedConfig);
+      } else {
+        await gatewayService.updateConfig(savedConfig);
+        runtimeStatus = gatewayService.getStatus();
+      }
+    } else if (restartRequired) {
       runtimeStatus = await gatewayService.start(savedConfig);
     } else {
       await gatewayService.updateConfig(savedConfig);
@@ -318,11 +333,13 @@ const rpcHandlers: Record<string, RpcHandler> = {
   getProfileRuntimeStatus: () => getProfileRuntimeStatus(),
   getProviderAccountSnapshots: (provider, options) => getProviderAccountSnapshots(provider as string | undefined, options as ProviderAccountSnapshotRequestOptions | undefined),
   getProviderCatalogModels: (request) => getProviderCatalogModels(request as ProviderCatalogModelsRequest),
+  getOpenRouterProviderCatalog: (request) => getOpenRouterProviderCatalog(request as OpenRouterProviderCatalogRequest),
   getProviderPresets: () => getProviderPresets(),
   getProxyCertificateStatus: () => proxyService.getCertificateStatus(),
   getProxyNetworkCaptures: () => proxyService.getNetworkCaptures(),
   getProxyStatus: () => proxyService.getStatus(),
   getRequestLogDetail: (request) => getRequestLogDetail(request as RequestLogDetailRequest),
+  getRequestLogBodyChunk: (request) => getRequestLogBodyChunk(request as RequestLogBodyChunkRequest),
   getRequestLogs: (filter) => getRequestLogs(filter as RequestLogListFilter | undefined),
   getUpdateStatus: () => unsupportedUpdateStatus,
   getUsageStats: (range, filter) => getUsageStats(range as UsageStatsRange | undefined, filter as UsageStatsFilter | undefined),
@@ -365,7 +382,7 @@ const rpcHandlers: Record<string, RpcHandler> = {
   openProfile: async (request) => {
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(await loadAppConfig());
     const config = syncedClaudeAppConfig.config;
-    const status = await gatewayService.start(config);
+    const status = await gatewayService.ensureStarted(config);
     if (status.state !== "running") {
       throw new Error(status.lastError || "CCR gateway did not start.");
     }
@@ -381,14 +398,14 @@ const rpcHandlers: Record<string, RpcHandler> = {
   restartGateway: async () => {
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(await loadAppConfig());
     const config = syncedClaudeAppConfig.config;
-    const status = await gatewayService.start(config);
+    const status = await gatewayService.restart(config);
     await applyProfileIfServiceRunning(config, status);
     return status;
   },
   restartProxy: async () => {
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(await loadAppConfig());
     const config = syncedClaudeAppConfig.config;
-    const status = await gatewayService.start(config);
+    const status = await gatewayService.restart(config);
     await applyProfileIfServiceRunning(config, status);
     return proxyService.getStatus();
   },
@@ -397,6 +414,7 @@ const rpcHandlers: Record<string, RpcHandler> = {
     await revealFile(PROXY_CA_CERT_FILE);
   },
   resetCodexRateLimitCredit: (request) => resetCodexRateLimitCredit(request as ProviderAccountResetRequest),
+  resetOverviewStatistics: () => resetOverviewStatistics(),
   saveApiKeys: async (apiKeys) => {
     const savedConfig = await saveApiKeysConfig(apiKeys as ApiKeyConfig[]);
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(savedConfig);
@@ -419,7 +437,16 @@ const rpcHandlers: Record<string, RpcHandler> = {
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(savedConfig);
     savedConfig = syncedClaudeAppConfig.config;
     let runtimeStatus = gatewayService.getStatus();
-    if (syncedClaudeAppConfig.configChanged || shouldRestartGatewayForRuntimeConfigChange(previousConfig, savedConfig)) {
+    const restartRequired = syncedClaudeAppConfig.configChanged ||
+      shouldRestartGatewayForRuntimeConfigChange(previousConfig, savedConfig);
+    if (runtimeStatus.gatewayManagedExternally) {
+      if (restartRequired) {
+        runtimeStatus = await gatewayService.restart(savedConfig);
+      } else {
+        await gatewayService.updateConfig(savedConfig);
+        runtimeStatus = gatewayService.getStatus();
+      }
+    } else if (restartRequired) {
       runtimeStatus = await gatewayService.start(savedConfig);
     } else {
       await gatewayService.updateConfig(savedConfig);
@@ -428,6 +455,7 @@ const rpcHandlers: Record<string, RpcHandler> = {
       await applyProfileIfServiceRunning(savedConfig, runtimeStatus);
     }
     invalidateProviderAccountSnapshotCache();
+    syncProviderModelAutoRefresh(savedConfig);
     return savedConfig;
   },
   scanBotHandoffBluetoothTargets: () => scanBotHandoffBluetoothTargets(),
@@ -442,7 +470,7 @@ const rpcHandlers: Record<string, RpcHandler> = {
   startGateway: async () => {
     const syncedClaudeAppConfig = await syncClaudeAppGatewayConfig(await loadAppConfig());
     const config = syncedClaudeAppConfig.config;
-    const status = await gatewayService.start(config);
+    const status = await gatewayService.ensureStarted(config);
     await applyProfileIfServiceRunning(config, status);
     return status;
   },
@@ -467,7 +495,7 @@ async function startConfiguredServices(reason: string): Promise<void> {
     } catch (error) {
       console.error(`Failed to sync Claude App gateway config during ${reason}: ${formatError(error)}`);
     }
-    const status = await gatewayService.start(config);
+    const status = await gatewayService.ensureStarted(config);
     if (status.state === "error") {
       console.error(`Failed to start gateway during ${reason}: ${status.lastError}`);
     }
@@ -482,12 +510,14 @@ async function startConfiguredServices(reason: string): Promise<void> {
         console.error(`Proxy mode is enabled, but system proxy is ${proxyStatus.systemProxy.state} during ${reason}${details}`);
       }
     }
+    syncProviderModelAutoRefresh(config);
   } catch (error) {
     console.error(`Failed to start configured services during ${reason}: ${formatError(error)}`);
   }
 }
 
 async function stopConfiguredServices(): Promise<void> {
+  stopProviderModelAutoRefreshService();
   await gatewayService.stop({ proxyRestoreTimeoutMs: 30_000 }).catch((error) => {
     console.error(`Failed to stop gateway: ${formatError(error)}`);
   });
@@ -505,6 +535,17 @@ async function applyProfileIfServiceRunning(config: AppConfig, status: GatewaySt
   logProfileApplyResult(await applyProfileConfig(config));
 }
 
+function syncProviderModelAutoRefresh(config: AppConfig): void {
+  syncProviderModelAutoRefreshService(config, {
+    logger: console,
+    onConfigChanged: async (nextConfig) => {
+      await gatewayService.updateConfig(nextConfig);
+      await applyProfileIfServiceRunning(nextConfig, gatewayService.getStatus());
+      invalidateProviderAccountSnapshotCache();
+    }
+  });
+}
+
 function logProfileApplyResult(result: ProfileApplyResult): void {
   for (const client of result.clients) {
     if (!client.ok) {
@@ -514,8 +555,7 @@ function logProfileApplyResult(result: ProfileApplyResult): void {
 }
 
 function getCliAppInfo(): AppInfo {
-  const chatgptAppPath = findInstalledCodexAppExecutable().executable;
-  const opencodeAppPath = findInstalledOpenCodeAppExecutable().executable;
+  const { chatgptAppPath, opencodeAppPath, workbuddyAppPath } = getAppInfoPaths();
   return {
     ...(chatgptAppPath ? { chatgptAppPath } : {}),
     configDbFile: APP_CONFIG_DB_FILE,
@@ -528,7 +568,8 @@ function getCliAppInfo(): AppInfo {
     platform: process.platform,
     requestLogsDbFile: REQUEST_LOGS_DB_FILE,
     usageDbFile: USAGE_DB_FILE,
-    version: packageJson.version
+    version: packageJson.version,
+    ...(workbuddyAppPath ? { workbuddyAppPath } : {})
   };
 }
 
@@ -1095,6 +1136,11 @@ function pluginPermissionAlias(value: string): string {
     case "route":
     case "routes":
       return "gateway-routes";
+    case "gateway-request-transform":
+    case "gateway-request-transforms":
+    case "request-transform":
+    case "request-transforms":
+      return "gateway-request-transforms";
     case "proxy":
     case "proxy-route":
       return "proxy-routes";

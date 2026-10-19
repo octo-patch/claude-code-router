@@ -96,7 +96,7 @@ CCR 会自动为第三方或非 GPT 模型适配 Codex 的 `apply_patch` 文件�
 3. 选择脚本文件，设置 10–30000 毫秒的超时时间，然后使用 **验证** 或 **测试脚本** 检查结果。
 4. 保存规则。CCR 会在每次执行前重新读取文件，因此后续修改脚本内容不需要重新保存规则。
 
-桌面版文件选择器保存绝对路径。Web UI 不能获得浏览器所选文件的真实路径，需要手动填写 CCR 服务所在机器上的绝对路径、相对路径或 `~/...` 路径；相对路径以 CCR 进程的工作目录为基准。单个脚本文件最大 64 KiB。
+桌面版文件选择器保存绝对路径。Web UI 不能获得浏览器所选文件的真实路径，需要手动填写 CCR 服务所在机器上的绝对路径、相对路径或 `~/...` 路径；相对路径以 CCR 进程的工作目录为基准。单个脚本文件最大 5 MiB。
 
 脚本文件是一个 **异步函数体**。直接使用已注入的 `input`、`api` 和 `return`；不需要写 `module.exports`、`export default` 或 `import`：
 
@@ -397,7 +397,7 @@ return {
 
 | 限制 | 当前值 |
 | --- | --- |
-| 脚本文件 | 最大 64 KiB |
+| 脚本文件 | 最大 5 MiB |
 | 执行超时 | 10–30000 毫秒，默认 2000 毫秒 |
 | Fetch 请求体 / 响应体 | 256 KiB / 1 MiB |
 | 单次文件读取或写入 | 1 MiB |
@@ -524,3 +524,14 @@ Header 名不区分大小写。Body 字段按点号路径读取，数字片段�
 - 状态码和错误信息。
 
 如果发生了回退，响应头里会带有 `x-ccr-fallback-attempts`、`x-ccr-fallback-failures`、延迟尝试的 `x-ccr-fallback-delays-ms`，以及最终命中的 `x-ccr-fallback-model`。请求日志详情里也会显示关联的重试尝试列表。
+
+### 可选：Jev 语义路由示例
+
+仓库的 [`examples/routing/jev.js`](https://github.com/musistudio/claude-code-router/blob/main/examples/routing/jev.js) 可直接作为 Node.js 脚本规则加载。它使用 [TypeSafe HTTP API](https://docs.typesafe.ai/api) 的 [Choice](https://docs.typesafe.ai/primitives/choice) 在两个已配置模型之间选择；也可连接实现相同接口的本地服务。
+
+1. 在 CCR 的启动环境中设置 `CCR_JEV_ROUTING_ENABLED=1`、`CCR_JEV_FAST_MODEL=供应商/快速模型`、`CCR_JEV_REASONING_MODEL=供应商/推理模型` 和 `TYPESAFE_API_KEY`。桌面应用需从能继承这些环境变量的启动环境运行。
+2. 添加 Node.js 脚本规则并选择该文件。建议先使用 1500 ms 总超时进行测试，把规则放在处理 `auto` 的静态回退规则之前。
+3. 客户端模型设为 `auto` 时才参与分类。明确指定模型、图片请求、未配置服务、低置信度、网络错误或超时都会继续后续规则。
+4. `CCR_JEV_ENDPOINT` 可指定完整接口地址，`CCR_JEV_MODEL` 可指定分类模型。兼容的本地服务不强制要求密钥。
+
+启用后会把最后一条用户文本的前 8192 个字符、输入 Token 数和工具数量发给所配置的分类服务；云端调用会产生该服务的费用。不会发送请求鉴权 Header 或 System 内容。`CCR_JEV_MIN_CONFIDENCE` 默认 `0.75`，这是待按实际任务评估的示例阈值，不代表已验证的路由准确率。示例测试覆盖协议与失败回退，未测量真实模型准确率或延迟。

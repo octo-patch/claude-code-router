@@ -22,17 +22,16 @@ Docker 镜像适合常驻模型网关和浏览器管理。它包含 CCR Core、�
 宿主机 3458 -> 容器 Nginx 8080
                            |-> 静态管理 UI
                            |-> 管理 RPC：127.0.0.1:3459
-                           |-> 模型网关：127.0.0.1:3456
-                           `-> Core Runtime：127.0.0.1:3457
+                           `-> 模型网关：127.0.0.1:3456
 ```
 
-只应发布 Nginx 的容器端口 `8080`。`3459`、`3456`、`3457` 都是容器内部实现端口，不要分别映射到宿主机。
+只应发布 Nginx 的容器端口 `8080`。`3459` 和 `3456` 是容器内部实现端口，不要分别映射到宿主机。
 
 Nginx 对外提供：
 
 | 路径 | 用途 |
 | --- | --- |
-| `/`、`/pages/home/index.html` | 管理 UI。根路径会跳转到带管理 Token 的页面。 |
+| `/`、`/pages/home/index.html` | 管理 UI。根路径会跳转到管理页，并保留请求中已有的 `ccr_web_token` 参数；Nginx 不会自行添加 Token。 |
 | `/api/ccr/rpc` | 需要管理 Token 的管理 RPC。 |
 | `/health` | 模型网关健康状态；容器或 UI 状态不在此接口反映。 |
 | `/v1/*`、`/v1beta/*`、`/messages`、`/chat/completions`、`/responses`、`/interactions`、`/mcp/*` | 模型和 MCP 网关接口。 |
@@ -42,18 +41,20 @@ Nginx 对外提供：
 在仓库根目录执行：
 
 ```sh
-docker compose up -d --build
+npm run docker:compose:up
 docker compose logs -f ccr
 ```
 
-打开 <http://127.0.0.1:3458>。新数据卷上管理 UI 会立即可用；模型网关要在添加供应商和模型后才能正常启动。
+打开容器日志中打印的管理地址 `http://127.0.0.1:3458/?ccr_web_token=<token>`（仅在 Token 自动生成时打印；自行设置了 `CCR_WEB_AUTH_TOKEN` 时，请自行拼到地址后）。新数据卷上管理 UI 会立即可用；模型网关要在添加供应商和模型后才能正常启动。
+
+这个 npm Compose 脚本会在构建前准备本机的 `../../next-ai/gateway` checkout，让镜像使用支持插件的 ai-gateway runtime。如果直接运行 `docker compose up -d --build`，请先执行 `npm run docker:prepare-gateway`。`npm run docker:build` 也会自动完成这一步。
 
 首次配置顺序：
 
 1. 添加供应商和至少一个模型。
 2. 在 **API 密钥** 页面创建 CCR 客户端 Key。
 3. 在 **服务** 页面启动网关。
-4. 请求 `/health`，确认返回 `200` 和运行状态。
+4. 请求 `/health`，确认返回 `200` 和 `ok` 状态。
 5. 把客户端 Base URL 指向 `http://127.0.0.1:3458`，并使用刚创建的 CCR 客户端 Key。
 
 停止或移除容器不会自动删除命名卷：
@@ -83,7 +84,7 @@ services:
 不使用 Compose 时：
 
 ```sh
-docker build -t claude-code-router:local .
+npm run docker:build
 docker run -d \
   --name claude-code-router \
   --restart unless-stopped \
@@ -93,7 +94,7 @@ docker run -d \
   claude-code-router:local
 ```
 
-仓库也提供 `npm run docker:build` 和 `npm run docker:run`。后者使用 `3458` 和 `ccr-data`，但容器带 `--rm`，没有固定名称和自动重启策略，更适合临时验证。
+仓库也提供 `npm run docker:run`。它使用 `3458` 和 `ccr-data`，但容器带 `--rm`，没有固定名称和自动重启策略，更适合临时验证。
 
 ## 三类凭据不要混用
 
@@ -103,7 +104,7 @@ docker run -d \
 | CCR 客户端 API Key | 模型网关请求鉴权 | UI 的 **API 密钥** 页面 |
 | 上游供应商凭据 | CCR 调用模型供应商 | UI 的 **供应商** 页面 |
 
-不设置 `CCR_WEB_AUTH_TOKEN` 时，EntryPoint 每次启动容器都会生成新的随机 Token。打开根地址仍可工作，因为 Nginx 会跳转到包含当前 Token 的 URL；但持久部署和远程部署应固定一个足够长的强 Token。
+不设置 `CCR_WEB_AUTH_TOKEN` 时，EntryPoint 每次启动容器都会生成新的随机 Token，并把管理地址在容器日志中打印一次。Nginx 不会向客户端返回 Token：不带 Token 打开根地址只能加载页面，所有管理请求都会返回 `401`，需要在 URL 中带上 Token。页面会在当前浏览器标签页会话内保留它。持久部署和远程部署应固定一个足够长的强 Token。
 
 不要把 Token 直接写进 Shell 历史。可以创建不进入版本控制的环境文件：
 
@@ -217,7 +218,6 @@ docker compose logs --tail=200 ccr
 | `CCR_WEB_PORT` | `3459` | 管理服务容器内端口。 |
 | `CCR_GATEWAY_HOST` | `127.0.0.1` | 模型网关容器内监听地址。 |
 | `CCR_GATEWAY_PORT` | `3456` | Nginx 转发到的模型网关容器内端口。 |
-| `CCR_GATEWAY_CORE_PORT` | `3457` | Core Gateway Runtime 容器内端口。 |
 | `CCR_NO_GATEWAY` | `0` | 设为 `1`、`true` 或 `yes` 时，启动阶段只运行管理 UI。 |
 | `CCR_DOCKER_INIT_CONFIG` | `1` | 设为 `0` 时禁用首次最小 `config.json` 引导。 |
 | `CCR_DOCKER_SYNC_PUBLIC_ENDPOINT` | `1` | 设为 `0` 时不再在启动时同步已有 JSON / SQLite 的监听和公开地址字段。 |
@@ -258,7 +258,7 @@ docker compose config
 
 ### 根地址返回 `302`
 
-这是正常行为。Nginx 正在把根地址跳转到带 URL 编码管理 Token 的页面。
+这是正常行为。Nginx 把根地址跳转到管理页并保留查询参数，因此你提供的 `ccr_web_token` 不会丢失；Nginx 自身不会添加 Token。
 
 ### `/health` 返回 `502`
 
@@ -266,7 +266,7 @@ docker compose config
 
 ### 修改 Token 后 UI 返回 `401`
 
-重新打开不带参数的根地址，让 Nginx 生成包含新 Token 的 URL；关闭仍使用旧 `ccr_web_token` 的标签页和书签。
+用当前 Token 重新打开 `/?ccr_web_token=<token>`（自动生成的 Token 可在 `docker compose logs ccr` 中查看）；关闭仍使用旧 `ccr_web_token` 的标签页和书签。
 
 ### 客户端仍使用旧端口或域名
 

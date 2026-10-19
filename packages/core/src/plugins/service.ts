@@ -16,6 +16,7 @@ import {
   type ProviderAccountMeter,
   type ProviderAccountPluginConnectorConfig,
   type ProviderAccountSnapshot,
+  type RequestRouteTraceChange,
   CLAUDE_DESIGN_PLUGIN_ID,
   CLAUDE_SHIP_PLUGIN_ID,
   GATEWAY_PLUGIN_PERMISSION_IDS,
@@ -23,8 +24,10 @@ import {
   knownGatewayPluginDefaultSurfaces
 } from "@ccr/core/contracts/app";
 import { backendService, type RegisteredHttpBackend, type SqliteStore, type SqliteStoreOptions } from "@ccr/core/plugins/backend-service";
+import { openRouterDiscountProviderRouterTransform } from "@ccr/core/plugins/built-ins/openrouter-discount-provider-router";
 import { CONFIGDIR, DATADIR } from "@ccr/core/config/constants";
 import { isDesktopAppRuntime } from "@ccr/core/runtime/desktop-app";
+import type { ProviderAccountWebContentFetchRequest } from "@ccr/core/providers/account-webcontent";
 
 type MaybePromise<T> = T | Promise<T>;
 type PluginLogger = {
@@ -64,13 +67,67 @@ export type GatewayPluginHttpBackendRegistration = {
 export type GatewayPluginProviderAccountRequest = {
   config: AppConfig;
   connector: ProviderAccountPluginConnectorConfig;
+  fetchProviderAccountJson: (request: GatewayPluginProviderAccountJsonFetchRequest) => Promise<unknown>;
   now: string;
   provider: GatewayProviderConfig;
+};
+
+export type GatewayPluginProviderAccountJsonFetchRequest = Omit<ProviderAccountWebContentFetchRequest, "provider"> & {
+  provider?: GatewayProviderConfig;
 };
 
 export type GatewayPluginProviderAccountConnector = {
   id: string;
   resolve: (request: GatewayPluginProviderAccountRequest) => MaybePromise<ProviderAccountMeter[] | ProviderAccountSnapshot | undefined>;
+};
+
+export type GatewayPluginRequestTransformInput = {
+  body?: Record<string, unknown>;
+  headers: Record<string, string>;
+  method: string;
+  path: string;
+  requestId: string;
+  routedModel?: string;
+  sessionId?: string;
+  tokenCount?: number;
+  url: string;
+};
+
+export type GatewayPluginRequestTransformResult = {
+  body?: Record<string, unknown>;
+  headers?: Record<string, string | number | boolean | null | undefined>;
+  responseHeaders?: Record<string, string | number | boolean | null | undefined>;
+  routedModel?: string;
+};
+
+export type GatewayPluginRequestTransformContext = Pick<
+  GatewayPluginContext,
+  "config" | "logger" | "openSqliteStore" | "paths" | "permissions" | "pluginConfig" | "pluginId"
+>;
+
+export type GatewayPluginRequestTransformHandler = (
+  input: GatewayPluginRequestTransformInput,
+  context: GatewayPluginRequestTransformContext
+) => MaybePromise<GatewayPluginRequestTransformResult | null | undefined | false>;
+
+export type GatewayPluginRequestTransformRegistration = {
+  id?: string;
+  transform: GatewayPluginRequestTransformHandler;
+};
+
+export type GatewayPluginRequestTransformApplied = {
+  changes: RequestRouteTraceChange[];
+  id: string;
+  pluginId: string;
+  responseHeaders: Record<string, string>;
+};
+
+export type GatewayPluginRequestTransformOutput = {
+  applied: GatewayPluginRequestTransformApplied[];
+  body?: Record<string, unknown>;
+  headers: Record<string, string>;
+  responseHeaders: Record<string, string>;
+  routedModel?: string;
 };
 
 export type GatewayPluginStopReason = "disabled" | "reload" | "stop";
@@ -85,10 +142,12 @@ export type GatewayPluginRegistration = {
   apps?: GatewayPluginAppConfig[];
   coreGateway?: {
     config?: Record<string, unknown>;
+    plugins?: unknown[];
     providerPlugins?: unknown[];
     virtualModelProfiles?: unknown[];
   };
   gatewayRoutes?: GatewayPluginRouteRegistration[];
+  gatewayRequestTransforms?: GatewayPluginRequestTransformRegistration[];
   onStop?: GatewayPluginStopHandler;
   providerAccountConnectors?: GatewayPluginProviderAccountConnector[];
   proxyRoutes?: GatewayPluginProxyRouteRegistration[];
@@ -108,10 +167,12 @@ export type GatewayPluginContext = {
   pluginId: string;
   permissions: GatewayPluginPermission[];
   openSqliteStore: (options?: PluginSqliteStoreOptions) => Promise<PluginSqliteStore>;
+  registerCoreGatewayPlugin: (plugin: unknown) => void;
   registerCoreGatewayProviderPlugin: (providerPlugin: unknown) => void;
   registerCoreGatewayVirtualModelProfile: (profile: unknown) => void;
   registerApp: (app: GatewayPluginAppConfig) => void;
   registerGatewayRoute: (route: GatewayPluginRouteRegistration) => void;
+  registerGatewayRequestTransform: (transform: GatewayPluginRequestTransformRegistration) => void;
   registerHttpBackend: (backend: GatewayPluginHttpBackendRegistration) => Promise<RegisteredHttpBackend>;
   registerProviderAccountConnector: (connector: GatewayPluginProviderAccountConnector) => void;
   registerProxyRoute: (route: GatewayPluginProxyRouteRegistration) => void;
@@ -155,6 +216,10 @@ type RegisteredProxyRoute = Omit<GatewayPluginProxyRouteRegistration, "host" | "
   pluginId: string;
 };
 
+type RegisteredGatewayRequestTransform = Required<Pick<GatewayPluginRequestTransformRegistration, "id" | "transform">> & {
+  pluginId: string;
+};
+
 type LoadedPlugin = {
   activate?: (context: GatewayPluginContext) => MaybePromise<GatewayPluginRegistration | void>;
   setup?: (context: GatewayPluginContext) => MaybePromise<GatewayPluginRegistration | void>;
@@ -175,7 +240,9 @@ type PluginPermissionAccess = {
 type PluginServiceStateSnapshot = {
   apps: InstalledBrowserApp[];
   coreGatewayConfig: Record<string, unknown>;
+  coreGatewayPlugins: unknown[];
   coreProviderPlugins: unknown[];
+  gatewayRequestTransforms: RegisteredGatewayRequestTransform[];
   gatewayRoutes: RegisteredGatewayRoute[];
   providerAccountConnectors: Map<string, GatewayPluginProviderAccountConnector>;
   proxyRoutes: RegisteredProxyRoute[];
@@ -189,8 +256,10 @@ const requireFromHere = createRequire(__filename);
 class GatewayPluginService {
   private config?: AppConfig;
   private coreGatewayConfig: Record<string, unknown> = {};
+  private coreGatewayPlugins: unknown[] = [];
   private coreProviderPlugins: unknown[] = [];
   private apps: InstalledBrowserApp[] = [];
+  private gatewayRequestTransforms: RegisteredGatewayRequestTransform[] = [];
   private gatewayRoutes: RegisteredGatewayRoute[] = [];
   private proxyRoutes: RegisteredProxyRoute[] = [];
   private providerAccountConnectors = new Map<string, GatewayPluginProviderAccountConnector>();
@@ -201,6 +270,7 @@ class GatewayPluginService {
   async start(config: AppConfig): Promise<void> {
     await this.stop({ nextConfig: config });
     this.config = config;
+    this.registerBuiltInGatewayRequestTransforms();
 
     for (const pluginConfig of config.plugins ?? []) {
       if (pluginConfig.enabled === false) {
@@ -242,19 +312,114 @@ class GatewayPluginService {
     this.config = undefined;
     this.apps = [];
     this.coreGatewayConfig = {};
+    this.coreGatewayPlugins = [];
     this.coreProviderPlugins = [];
+    this.gatewayRequestTransforms = [];
     this.gatewayRoutes = [];
     this.proxyRoutes = [];
     this.providerAccountConnectors.clear();
     this.virtualModelProfiles = [];
   }
 
-  hasGatewayRoutes(): boolean {
-    return this.gatewayRoutes.length > 0;
+  hasGatewayRoutes(options: { includePluginAdminRoutes?: boolean } = {}): boolean {
+    const includePluginAdminRoutes = options.includePluginAdminRoutes !== false;
+    return this.gatewayRoutes.some((route) =>
+      includePluginAdminRoutes || !isPluginAdminGatewayRoute(route)
+    );
+  }
+
+  hasGatewayRequestTransforms(options: { includeBuiltIns?: boolean } = {}): boolean {
+    const includeBuiltIns = options.includeBuiltIns !== false;
+    return this.gatewayRequestTransforms.some((transform) =>
+      includeBuiltIns || transform.pluginId !== "openrouter"
+    );
+  }
+
+  async applyGatewayRequestTransforms(input: GatewayPluginRequestTransformInput): Promise<GatewayPluginRequestTransformOutput> {
+    let body = cloneJsonObject(input.body);
+    let headers = { ...input.headers };
+    let routedModel = input.routedModel;
+    const responseHeaders: Record<string, string> = {};
+    const applied: GatewayPluginRequestTransformApplied[] = [];
+
+    for (const transform of this.gatewayRequestTransforms) {
+      const beforeBody = body;
+      const beforeHeaders = headers;
+      const beforeRoutedModel = routedModel;
+      let result: GatewayPluginRequestTransformResult | null | undefined | false;
+      try {
+        result = await transform.transform({
+          body: cloneJsonObject(body),
+          headers: { ...headers },
+          method: input.method,
+          path: input.path,
+          requestId: input.requestId,
+          ...(routedModel ? { routedModel } : {}),
+          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+          ...(input.tokenCount !== undefined ? { tokenCount: input.tokenCount } : {}),
+          url: input.url
+        }, this.createRequestTransformContext(transform.pluginId));
+      } catch (error) {
+        console.warn(`[plugin:${transform.pluginId}] Request transform ${transform.id} failed: ${formatError(error)}`);
+        continue;
+      }
+      if (!result || !isRecord(result)) {
+        continue;
+      }
+
+      const changes: RequestRouteTraceChange[] = [];
+      const nextBody = isRecord(result.body) ? cloneJsonObject(result.body) : body;
+      if (nextBody && nextBody !== beforeBody && JSON.stringify(nextBody) !== JSON.stringify(beforeBody)) {
+        body = nextBody;
+        changes.push({ operation: beforeBody ? "replace" : "add", path: "/body", scope: "body" });
+      }
+
+      const nextHeaders = applyHeaderPatch(headers, result.headers);
+      headers = nextHeaders.headers;
+      changes.push(...nextHeaders.changes(beforeHeaders));
+
+      if (typeof result.routedModel === "string" && result.routedModel.trim() && result.routedModel !== beforeRoutedModel) {
+        routedModel = result.routedModel.trim();
+        changes.push({
+          ...(beforeRoutedModel ? { before: beforeRoutedModel } : {}),
+          after: routedModel,
+          operation: beforeRoutedModel ? "replace" : "add",
+          path: "/routing/model",
+          scope: "routing"
+        });
+      }
+
+      const transformResponseHeaders = normalizedStringHeaders(result.responseHeaders);
+      Object.assign(responseHeaders, transformResponseHeaders);
+      if (changes.length > 0 || Object.keys(transformResponseHeaders).length > 0) {
+        applied.push({
+          changes,
+          id: transform.id,
+          pluginId: transform.pluginId,
+          responseHeaders: transformResponseHeaders
+        });
+      }
+    }
+
+    return {
+      applied,
+      ...(body ? { body } : {}),
+      headers,
+      responseHeaders,
+      ...(routedModel ? { routedModel } : {})
+    };
   }
 
   getCoreGatewayConfig(): Record<string, unknown> {
-    return { ...this.coreGatewayConfig };
+    const configuredPlugins = Array.isArray(this.coreGatewayConfig.plugins)
+      ? this.coreGatewayConfig.plugins
+      : [];
+    return {
+      ...this.coreGatewayConfig,
+      ...(configuredPlugins.length + this.coreGatewayPlugins.length > 0
+        ? { plugins: [...configuredPlugins, ...this.coreGatewayPlugins] }
+        : {})
+    };
   }
 
   getCoreProviderPlugins(): unknown[] {
@@ -402,6 +567,13 @@ class GatewayPluginService {
     for (const route of registration.gatewayRoutes ?? []) {
       this.registerGatewayRoute(pluginId, route);
     }
+    if ((registration.gatewayRequestTransforms ?? []).length > 0) {
+      this.requirePluginSurface(pluginConfig, "gateway", "register gateway request transforms");
+      this.requirePluginPermission(permissions, "gateway-request-transforms", "register gateway request transforms");
+    }
+    for (const transform of registration.gatewayRequestTransforms ?? []) {
+      this.registerGatewayRequestTransform(pluginId, transform);
+    }
     if ((registration.proxyRoutes ?? []).length > 0) {
       this.requirePluginSurface(pluginConfig, "gateway", "register proxy routes");
       this.requirePluginPermission(permissions, "proxy-routes", "register proxy routes");
@@ -433,13 +605,17 @@ class GatewayPluginService {
     ]) {
       this.virtualModelProfiles.push(profile);
     }
+    if ((registration.coreGateway?.plugins ?? []).length > 0) {
+      this.requirePluginSurface(pluginConfig, "gateway", "register core gateway plugins");
+      this.requirePluginPermission(permissions, "core-gateway-plugins", "register core gateway plugins");
+    }
+    for (const plugin of registration.coreGateway?.plugins ?? []) {
+      this.coreGatewayPlugins.push(plugin);
+    }
     if (registration.coreGateway?.config) {
       this.requirePluginSurface(pluginConfig, "gateway", "register core gateway config");
       this.requirePluginPermission(permissions, "core-gateway-config", "register core gateway config");
-      this.coreGatewayConfig = {
-        ...this.coreGatewayConfig,
-        ...registration.coreGateway.config
-      };
+      this.coreGatewayConfig = mergeCoreGatewayConfig(this.coreGatewayConfig, registration.coreGateway.config);
     }
     if (registration.stop) {
       this.stopHooks.push({ pluginId, stop: registration.stop });
@@ -483,12 +659,15 @@ class GatewayPluginService {
     for (const profile of pluginConfig.coreGateway?.virtualModelProfiles ?? []) {
       this.virtualModelProfiles.push(profile);
     }
+    if ((pluginConfig.coreGateway?.plugins ?? []).length > 0) {
+      this.requirePluginPermission(permissions, "core-gateway-plugins", "register configured core gateway plugins");
+    }
+    for (const plugin of pluginConfig.coreGateway?.plugins ?? []) {
+      this.coreGatewayPlugins.push(plugin);
+    }
     if (pluginConfig.coreGateway?.config) {
       this.requirePluginPermission(permissions, "core-gateway-config", "register configured core gateway config");
-      this.coreGatewayConfig = {
-        ...this.coreGatewayConfig,
-        ...pluginConfig.coreGateway.config
-      };
+      this.coreGatewayConfig = mergeCoreGatewayConfig(this.coreGatewayConfig, pluginConfig.coreGateway.config);
     }
   }
 
@@ -505,6 +684,25 @@ class GatewayPluginService {
       path: normalizeRoutePath(route.path),
       pathPrefix: normalizeRoutePath(route.pathPrefix),
       pluginId
+    });
+  }
+
+  private registerGatewayRequestTransform(pluginId: string, transform: GatewayPluginRequestTransformRegistration): void {
+    if (typeof transform.transform !== "function") {
+      throw new Error(`Plugin ${pluginId} registered an invalid gateway request transform.`);
+    }
+    this.gatewayRequestTransforms.push({
+      id: transform.id?.trim() || `${pluginId}:request-transform:${this.gatewayRequestTransforms.length + 1}`,
+      pluginId,
+      transform: transform.transform
+    });
+  }
+
+  private registerBuiltInGatewayRequestTransforms(): void {
+    this.gatewayRequestTransforms.push({
+      id: "openrouter-discount-provider-router",
+      pluginId: "openrouter",
+      transform: openRouterDiscountProviderRouterTransform
     });
   }
 
@@ -544,6 +742,11 @@ class GatewayPluginService {
         this.requirePluginPermission(permissions, "sqlite-store", "open a SQLite store");
         return this.openSqliteStore(pluginConfig.id, pluginDataDir, options);
       },
+      registerCoreGatewayPlugin: (plugin) => {
+        this.requirePluginSurface(pluginConfig, "gateway", "register core gateway plugins");
+        this.requirePluginPermission(permissions, "core-gateway-plugins", "register core gateway plugins");
+        this.coreGatewayPlugins.push(plugin);
+      },
       registerCoreGatewayProviderPlugin: (providerPlugin) => {
         this.requirePluginSurface(pluginConfig, "provider", "register core provider plugins");
         this.requirePluginPermission(permissions, "core-provider-plugins", "register core provider plugins");
@@ -563,6 +766,11 @@ class GatewayPluginService {
         this.requirePluginSurface(pluginConfig, "gateway", "register gateway routes");
         this.requirePluginPermission(permissions, "gateway-routes", "register gateway routes");
         this.registerGatewayRoute(pluginConfig.id, route);
+      },
+      registerGatewayRequestTransform: (transform) => {
+        this.requirePluginSurface(pluginConfig, "gateway", "register gateway request transforms");
+        this.requirePluginPermission(permissions, "gateway-request-transforms", "register gateway request transforms");
+        this.registerGatewayRequestTransform(pluginConfig.id, transform);
       },
       registerHttpBackend: (backend) => {
         this.requirePluginSurface(pluginConfig, "gateway", "register HTTP backends");
@@ -591,6 +799,30 @@ class GatewayPluginService {
       ...connector,
       id
     });
+  }
+
+  private createRequestTransformContext(pluginId: string): GatewayPluginRequestTransformContext {
+    const pluginConfig = this.config?.plugins.find((plugin) => plugin.id === pluginId);
+    const permissions = pluginPermissionAccess(pluginConfig ?? { id: pluginId });
+    const pluginPermissions = pluginPermissionList(permissions);
+    const pluginDataDir = path.join(DATADIR, "plugins", sanitizeFileSegment(pluginId));
+    const logger = createPluginLogger(pluginId);
+    return {
+      config: this.config ?? ({} as AppConfig),
+      logger,
+      paths: {
+        configDir: CONFIGDIR,
+        dataDir: DATADIR,
+        pluginDataDir
+      },
+      permissions: pluginPermissions,
+      pluginConfig: pluginConfig?.config,
+      pluginId,
+      openSqliteStore: (options) => {
+        this.requirePluginPermission(permissions, "sqlite-store", "open a SQLite store");
+        return this.openSqliteStore(pluginId, pluginDataDir, options);
+      }
+    };
   }
 
   private createRouteContext(pluginId: string): GatewayPluginRouteContext {
@@ -688,7 +920,9 @@ class GatewayPluginService {
     return {
       apps: [...this.apps],
       coreGatewayConfig: { ...this.coreGatewayConfig },
+      coreGatewayPlugins: [...this.coreGatewayPlugins],
       coreProviderPlugins: [...this.coreProviderPlugins],
+      gatewayRequestTransforms: [...this.gatewayRequestTransforms],
       gatewayRoutes: [...this.gatewayRoutes],
       providerAccountConnectors: new Map(this.providerAccountConnectors),
       proxyRoutes: [...this.proxyRoutes],
@@ -702,7 +936,9 @@ class GatewayPluginService {
     const newStopHooks = this.stopHooks.slice(snapshot.stopHooks.length).reverse();
     this.apps = snapshot.apps;
     this.coreGatewayConfig = snapshot.coreGatewayConfig;
+    this.coreGatewayPlugins = snapshot.coreGatewayPlugins;
     this.coreProviderPlugins = snapshot.coreProviderPlugins;
+    this.gatewayRequestTransforms = snapshot.gatewayRequestTransforms;
     this.gatewayRoutes = snapshot.gatewayRoutes;
     this.providerAccountConnectors = snapshot.providerAccountConnectors;
     this.proxyRoutes = snapshot.proxyRoutes;
@@ -935,6 +1171,11 @@ function matchesPathPrefix(prefix: string, requestPath: string): boolean {
   return normalizedPath === normalizedPrefix || normalizedPath.startsWith(`${normalizedPrefix.replace(/\/+$/, "")}/`);
 }
 
+function isPluginAdminGatewayRoute(route: RegisteredGatewayRoute): boolean {
+  const routePath = normalizeRoutePath(route.pathPrefix ?? route.path) ?? "/";
+  return routePath === "/plugins" || routePath.startsWith("/plugins/");
+}
+
 function joinUrlPaths(prefix: string, suffix: string): string {
   const normalizedPrefix = prefix === "/" ? "" : prefix.replace(/\/+$/, "");
   const normalizedSuffix = suffix.startsWith("/") ? suffix : `/${suffix}`;
@@ -983,6 +1224,74 @@ function sanitizeFileSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "plugin";
 }
 
+function cloneJsonObject(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!value) {
+    return undefined;
+  }
+  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+}
+
+function applyHeaderPatch(
+  headers: Record<string, string>,
+  patch: GatewayPluginRequestTransformResult["headers"]
+): { changes: (before: Record<string, string>) => RequestRouteTraceChange[]; headers: Record<string, string> } {
+  const next = { ...headers };
+  if (!isRecord(patch)) {
+    return { changes: () => [], headers: next };
+  }
+
+  const touched = new Set<string>();
+  for (const [rawName, rawValue] of Object.entries(patch)) {
+    const name = rawName.trim().toLowerCase();
+    if (!name) {
+      continue;
+    }
+    touched.add(name);
+    if (rawValue === undefined || rawValue === null) {
+      delete next[name];
+    } else {
+      next[name] = String(rawValue);
+    }
+  }
+
+  return {
+    headers: next,
+    changes: (before) => [...touched].flatMap((name) => {
+      const beforeValue = before[name];
+      const afterValue = next[name];
+      if (Object.is(beforeValue, afterValue)) {
+        return [];
+      }
+      return [{
+        ...(afterValue === undefined ? {} : { after: afterValue }),
+        ...(beforeValue === undefined ? {} : { before: beforeValue }),
+        operation: beforeValue === undefined ? "add" : afterValue === undefined ? "remove" : "replace",
+        path: `/headers/${escapeJsonPointer(name)}`,
+        scope: "headers"
+      } satisfies RequestRouteTraceChange];
+    })
+  };
+}
+
+function normalizedStringHeaders(value: GatewayPluginRequestTransformResult["responseHeaders"]): Record<string, string> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = rawName.trim().toLowerCase();
+    if (!name || rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    headers[name] = String(rawValue);
+  }
+  return headers;
+}
+
+function escapeJsonPointer(value: string): string {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
 function providerAccountConnectorKey(pluginId: string, connectorId: string): string {
   return `${pluginId.trim()}:${connectorId.trim()}`;
 }
@@ -1021,6 +1330,37 @@ function stopReasonForPlugin(pluginId: string, nextEnabledPluginIds: Set<string>
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function mergeCoreGatewayConfig(
+  current: Record<string, unknown>,
+  patch: Record<string, unknown>,
+  path: string[] = []
+): Record<string, unknown> {
+  const next = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    const previous = next[key];
+    const childPath = [...path, key];
+    if (isRecord(previous) && isRecord(value)) {
+      next[key] = mergeCoreGatewayConfig(previous, value, childPath);
+      continue;
+    }
+    if (
+      Array.isArray(previous) &&
+      Array.isArray(value) &&
+      shouldAppendCoreGatewayConfigArray(childPath)
+    ) {
+      next[key] = [...previous, ...value];
+      continue;
+    }
+    next[key] = value;
+  }
+  return next;
+}
+
+function shouldAppendCoreGatewayConfigArray(path: string[]): boolean {
+  const key = path.join(".");
+  return key === "plugins" || key === "agent.mcpServers";
 }
 
 function formatError(error: unknown): string {

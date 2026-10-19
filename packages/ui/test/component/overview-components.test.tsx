@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { formatCodexResetCardExpiry, formatCodexResetCardNumber, OverviewView } from "@ccr/ui/pages/home/components/dashboard.tsx";
+import { formatCodexResetCardExpiry, formatCodexResetCardNumber, OverviewStatisticsResetDialog, OverviewView } from "@ccr/ui/pages/home/components/dashboard.tsx";
 import { AppI18nContext, appCopy } from "@ccr/ui/pages/home/shared/i18n.tsx";
 import { parseStatusBucketDate } from "@ccr/ui/pages/home/shared/controls.tsx";
 import { formatProviderAccountMeterValue, providerAccountMeterDetailValidityProgress } from "@ccr/ui/pages/home/shared/provider-accounts.ts";
@@ -47,6 +47,7 @@ test("OverviewView renders every overview widget type", () => {
   assert.doesNotMatch(html, /<h2 class="[^"]*">Overview<\/h2>/);
   assert.match(html, /All providers/);
   assert.match(html, /All models/);
+  assert.match(html, /Reset statistics/);
   assert.match(html, /aria-label="Edit widgets"/);
   assert.match(html, /aria-pressed="true"/);
   assert.match(html, /overview-heading-icon/);
@@ -73,6 +74,44 @@ test("OverviewView renders every overview widget type", () => {
   assert.match(html, /AI Fuel Cockpit/);
   assert.match(html, /Token Calendar Poster/);
   assert.match(html, /Spend Receipt/);
+});
+
+test("OverviewStatisticsResetDialog warns before deleting statistics", () => {
+  const html = renderToStaticMarkup(
+    <OverviewStatisticsResetDialog
+      error=""
+      open
+      onClose={() => undefined}
+      onConfirm={() => undefined}
+    />
+  );
+
+  assert.match(html, /Reset overview statistics/);
+  assert.match(html, /Reset Overview statistics\?/);
+  assert.match(html, /Overview statistics data will be deleted and cannot be recovered\./);
+  assert.match(html, /Request logs and configuration are not deleted\./);
+  assert.match(html, />Cancel<\/button>/);
+  assert.match(html, />Reset<\/button>/);
+});
+
+test("OverviewStatisticsResetDialog renders Chinese warning copy", () => {
+  const html = renderToStaticMarkup(
+    <AppI18nContext.Provider value={appCopy.zh}>
+      <OverviewStatisticsResetDialog
+        error=""
+        open
+        onClose={() => undefined}
+        onConfirm={() => undefined}
+      />
+    </AppI18nContext.Provider>
+  );
+
+  assert.match(html, /重置概览统计/);
+  assert.match(html, /要重置概览统计数据吗？/);
+  assert.match(html, /概览统计数据将被删除且无法恢复。/);
+  assert.match(html, /请求日志和配置不会被删除。/);
+  assert.match(html, />取消<\/button>/);
+  assert.match(html, />重置<\/button>/);
 });
 
 test("OverviewView keeps Chinese token copy as Token", () => {
@@ -201,7 +240,9 @@ test("OverviewView folds overflowing account bento cards into a summary tile", (
 
   assert.match(html, /grid-cols-3/);
   assert.match(html, /overview-account-bento-more/);
-  assert.match(html, /\+2/);
+  // Two available rows hold five cards plus the overflow tile.
+  assert.equal((html.match(/data-provider-account-sortable-id=/g) ?? []).length, 5);
+  assert.match(html, /\+5/);
 });
 
 test("OverviewView compacts large account bento cards before showing a summary tile", () => {
@@ -242,29 +283,242 @@ test("OverviewView compacts large account bento cards before showing a summary t
   assert.doesNotMatch(html, /overview-account-bento-more/);
 });
 
-test("OverviewView places compact bento account values below the meter label", () => {
+test("OverviewView uses height-aware balance layouts at every account card size", () => {
+  const deepSeekAccount: ProviderAccountSnapshot = {
+    credentialId: "deepseek",
+    meters: [
+      {
+        id: "balance",
+        kind: "balance",
+        label: "Balance",
+        remaining: 21.59,
+        unit: "CNY"
+      },
+      {
+        id: "granted_balance",
+        kind: "balance",
+        label: "Granted balance",
+        remaining: 20,
+        unit: "CNY"
+      },
+      {
+        id: "topped_up_balance",
+        kind: "balance",
+        label: "Topped-up balance",
+        remaining: 1.59,
+        unit: "CNY"
+      }
+    ],
+    provider: "DeepSeek",
+    source: "standard",
+    status: "ok",
+    updatedAt: "2026-06-30T00:00:00.000Z"
+  };
+  const cardSizes = [
+    { columnClass: "col-span-1", layout: "compact", rowClass: "row-span-1", size: "1:1" },
+    { columnClass: "col-span-2", layout: "compact", rowClass: "row-span-1", size: "2:1" },
+    { columnClass: "col-span-1", layout: "expanded", rowClass: "row-span-2", size: "1:2" },
+    { columnClass: "col-span-2", layout: "expanded", rowClass: "row-span-2", size: "2:2" }
+  ] as const;
+
+  for (const cardSize of cardSizes) {
+    const html = renderToStaticMarkup(
+      <OverviewView
+        overviewWidgets={[{
+          accountCardSizes: { "DeepSeek::deepseek": cardSize.size },
+          enabled: true,
+          id: "account",
+          size: "4:3",
+          type: "account-balance",
+          variant: "cards"
+        }]}
+        providerAccounts={[deepSeekAccount, accountSnapshots()[1]]}
+        refreshProviderAccounts={() => undefined}
+        setUsageRange={() => undefined}
+        usageRange="30d"
+        usageStats={usageStats("30d")}
+        onWidgetsChange={() => undefined}
+      />
+    );
+    const cardStart = html.indexOf('data-provider-account-sortable-id="DeepSeek::deepseek"');
+    assert.ok(cardStart >= 0, `DeepSeek card should render at size ${cardSize.size}`);
+    const nextCardStart = html.indexOf('data-provider-account-sortable-id=', cardStart + 1);
+    const cardHtml = html.slice(cardStart, nextCardStart >= 0 ? nextCardStart : undefined);
+
+    assert.match(cardHtml, new RegExp(`overview-account-bento-tile[^"]*${cardSize.columnClass}[^"]*${cardSize.rowClass}[^"]*" data-account-status="ok" data-provider-account-card-layout="${cardSize.layout}"`));
+    assert.match(cardHtml, /Balance/);
+    assert.match(cardHtml, /¥21\.59/);
+    assert.doesNotMatch(html, /Granted balance|Topped-up balance/);
+    assert.doesNotMatch(cardHtml, /overflow-y-auto|176px/);
+    if (cardSize.layout === "compact") {
+      assert.match(cardHtml, /data-provider-account-compact-meter="true"/);
+      assert.match(cardHtml, /data-provider-account-compact-brand="true"/);
+      assert.doesNotMatch(cardHtml, /overview-account-bento-compact-meter/);
+    } else {
+      assert.doesNotMatch(cardHtml, /data-provider-account-compact-meter="true"/);
+      assert.doesNotMatch(cardHtml, /overview-account-bento-compact-meter/);
+    }
+  }
+});
+
+test("OverviewView pins compact account card identity and refresh above long errors", () => {
+  const errorAccount: ProviderAccountSnapshot = {
+    message: "Account endpoint returned HTTP 403: {\"code\":\"permission_denied\"}",
+    meters: [],
+    provider: "DeepSeek",
+    source: "standard",
+    status: "error",
+    updatedAt: "2026-06-30T00:00:00.000Z"
+  };
   const html = renderToStaticMarkup(
     <OverviewView
-      overviewWidgets={[{ enabled: true, id: "account", size: "4:2", type: "account-balance", variant: "cards" }]}
-      providerAccounts={[
-        {
-          credentialId: "deepseek",
-          meters: [
-            {
-              id: "balance",
-              kind: "balance",
-              label: "Balance",
-              remaining: 21.59,
-              unit: "CNY"
-            }
-          ],
-          provider: "DeepSeek",
-          source: "standard",
-          status: "ok",
-          updatedAt: "2026-06-30T00:00:00.000Z"
-        },
-        ...accountSnapshots()
-      ]}
+      overviewWidgets={[{
+        accountCardSizes: { DeepSeek: "2:1" },
+        enabled: true,
+        id: "account",
+        size: "4:2",
+        type: "account-balance",
+        variant: "cards"
+      }]}
+      providerAccounts={[errorAccount, accountSnapshots()[1]]}
+      refreshProviderAccounts={() => undefined}
+      setUsageRange={() => undefined}
+      usageRange="30d"
+      usageStats={usageStats("30d")}
+      onWidgetsChange={() => undefined}
+    />
+  );
+  const cardStart = html.indexOf('data-provider-account-sortable-id="DeepSeek"');
+  assert.ok(cardStart >= 0);
+  const nextCardStart = html.indexOf('data-provider-account-sortable-id=', cardStart + 1);
+  const cardHtml = html.slice(cardStart, nextCardStart >= 0 ? nextCardStart : undefined);
+  const brandStart = cardHtml.indexOf('data-provider-account-compact-brand="true"');
+  const actionsStart = cardHtml.indexOf('data-provider-account-compact-actions="true"');
+  const messageStart = cardHtml.indexOf('data-provider-account-compact-message="true"');
+
+  assert.ok(brandStart >= 0);
+  assert.ok(actionsStart >= 0);
+  assert.ok(messageStart >= 0);
+  assert.ok(brandStart < actionsStart);
+  assert.ok(actionsStart < messageStart);
+  assert.match(cardHtml.slice(brandStart, actionsStart), /DeepSeek/);
+  assert.doesNotMatch(cardHtml.slice(brandStart, actionsStart), /Account endpoint returned HTTP 403/);
+  assert.match(cardHtml.slice(messageStart), /Account endpoint returned HTTP 403/);
+  assert.doesNotMatch(cardHtml, /data-provider-account-compact-meter="true"/);
+});
+
+test("OverviewView shows secondary meters on tall account cards instead of folding to plus one", () => {
+  const account: ProviderAccountSnapshot = {
+    credentialId: "test",
+    meters: [
+      {
+        id: "5h",
+        kind: "quota",
+        label: "5 hour quota",
+        limit: 100,
+        remaining: 96,
+        unit: "%",
+        window: "5h"
+      },
+      {
+        id: "weekly",
+        kind: "quota",
+        label: "Weekly quota",
+        limit: 100,
+        remaining: 91,
+        unit: "%",
+        window: "weekly"
+      }
+    ],
+    provider: "Zhipu AI (China) - Coding Plan",
+    source: "standard",
+    status: "ok",
+    updatedAt: "2026-08-14T14:04:44.000Z"
+  };
+  const html = renderToStaticMarkup(
+    <OverviewView
+      overviewWidgets={[{
+        accountCardSizes: { "Zhipu AI (China) - Coding Plan::test": "1:2" },
+        enabled: true,
+        id: "account",
+        size: "2:2",
+        type: "account-balance",
+        variant: "cards"
+      }]}
+      providerAccounts={[account, accountSnapshots()[1]]}
+      refreshProviderAccounts={() => undefined}
+      setUsageRange={() => undefined}
+      usageRange="30d"
+      usageStats={usageStats("30d")}
+      onWidgetsChange={() => undefined}
+    />
+  );
+  const cardStart = html.indexOf('data-provider-account-sortable-id="Zhipu AI (China) - Coding Plan::test"');
+  assert.ok(cardStart >= 0);
+  const nextCardStart = html.indexOf('data-provider-account-sortable-id=', cardStart + 1);
+  const cardHtml = html.slice(cardStart, nextCardStart >= 0 ? nextCardStart : undefined);
+
+  assert.match(cardHtml, /5 hour quota/);
+  assert.match(cardHtml, /Weekly quota/);
+  assert.doesNotMatch(cardHtml, />\+1</);
+});
+
+test("OverviewView expands a single leftover account meter instead of showing plus one", () => {
+  const account: ProviderAccountSnapshot = {
+    credentialId: "test",
+    meters: [
+      {
+        id: "5h",
+        kind: "quota",
+        label: "5 hour quota",
+        limit: 100,
+        remaining: 95,
+        unit: "%",
+        window: "5h"
+      },
+      {
+        id: "weekly",
+        kind: "quota",
+        label: "Weekly quota",
+        limit: 100,
+        remaining: 91,
+        unit: "%",
+        window: "weekly"
+      },
+      {
+        id: "daily",
+        kind: "quota",
+        label: "Daily quota",
+        limit: 100,
+        remaining: 88,
+        unit: "%",
+        window: "daily"
+      },
+      {
+        id: "monthly",
+        kind: "quota",
+        label: "Monthly quota",
+        limit: 100,
+        remaining: 82,
+        unit: "%",
+        window: "monthly"
+      }
+    ],
+    provider: "Zhipu AI (China) - Coding Plan",
+    source: "standard",
+    status: "ok",
+    updatedAt: "2026-08-14T14:07:49.000Z"
+  };
+  const html = renderToStaticMarkup(
+    <OverviewView
+      overviewWidgets={[{
+        enabled: true,
+        id: "account",
+        size: "1:3",
+        type: "account-balance",
+        variant: "cards"
+      }]}
+      providerAccounts={[account]}
       refreshProviderAccounts={() => undefined}
       setUsageRange={() => undefined}
       usageRange="30d"
@@ -273,7 +527,47 @@ test("OverviewView places compact bento account values below the meter label", (
     />
   );
 
-  assert.match(html, /Balance<\/div><div class="mt-0\.5 truncate text-\[18px\][^"]*">¥21\.59<\/div>/);
+  assert.match(html, /5 hour quota/);
+  assert.match(html, /Monthly quota/);
+  assert.doesNotMatch(html, />\+1</);
+});
+
+test("OverviewView does not render folded account meter counts", () => {
+  const account: ProviderAccountSnapshot = {
+    credentialId: "test",
+    meters: [
+      { id: "5h", kind: "quota", label: "5 hour quota", limit: 100, remaining: 95, unit: "%", window: "5h" },
+      { id: "weekly", kind: "quota", label: "Weekly quota", limit: 100, remaining: 91, unit: "%", window: "weekly" },
+      { id: "daily", kind: "quota", label: "Daily quota", limit: 100, remaining: 88, unit: "%", window: "daily" },
+      { id: "monthly", kind: "quota", label: "Monthly quota", limit: 100, remaining: 82, unit: "%", window: "monthly" },
+      { id: "yearly", kind: "quota", label: "Yearly quota", limit: 100, remaining: 80, unit: "%", window: "yearly" },
+      { id: "credits", kind: "requests", label: "Request credits", remaining: 12, unit: "credits" }
+    ],
+    provider: "Zhipu AI (China) - Coding Plan",
+    source: "standard",
+    status: "ok",
+    updatedAt: "2026-08-14T14:07:49.000Z"
+  };
+  const html = renderToStaticMarkup(
+    <OverviewView
+      overviewWidgets={[{
+        enabled: true,
+        id: "account",
+        size: "1:3",
+        type: "account-balance",
+        variant: "cards"
+      }]}
+      providerAccounts={[account]}
+      refreshProviderAccounts={() => undefined}
+      setUsageRange={() => undefined}
+      usageRange="30d"
+      usageStats={usageStats("30d")}
+      onWidgetsChange={() => undefined}
+    />
+  );
+
+  assert.match(html, /5 hour quota/);
+  assert.doesNotMatch(html, />\+\d+</);
 });
 
 test("OverviewView applies manual bento account card sizes", () => {
@@ -286,7 +580,7 @@ test("OverviewView applies manual bento account card sizes", () => {
         },
         enabled: true,
         id: "account",
-        size: "4:2",
+        size: "4:3",
         type: "account-balance",
         variant: "cards"
       }]}

@@ -231,6 +231,7 @@ test("compact stores an immutable full request and appends one handoff task", as
   const config = testConfig();
   const body = {
     context_management: { edits: [{ reason: "compact", type: "compact_20260112" }] },
+    max_completion_tokens: 512,
     max_tokens: 777,
     messages: [
       { content: "Historical decision: use SQLite.", role: "user" },
@@ -267,7 +268,8 @@ test("compact stores an immutable full request and appends one handoff task", as
   assert.deepEqual(forwarded.messages.slice(0, body.messages.length), body.messages);
   assert.equal(forwarded.messages.length, body.messages.length + 1);
   assert.equal(forwarded.model, body.model);
-  assert.equal(forwarded.max_tokens, 2048);
+  assert.equal(forwarded.max_completion_tokens, undefined);
+  assert.equal(forwarded.max_tokens, undefined);
   assert.equal(forwarded.context_management, undefined);
   assert.equal(forwarded.response_format, undefined);
   assert.equal(forwarded.tools, undefined);
@@ -659,7 +661,9 @@ test("compact handoff strips protocol-specific tool and schema constraints", asy
   const result = await prepareContextArchiveRequest({
     body: Buffer.from(JSON.stringify({
       input: [{ content: [{ text: "Responses fact", type: "input_text" }], role: "user", type: "message" }],
+      maxCompletionTokens: 256,
       max_output_tokens: 128,
+      maxTokens: 1024,
       metadata: { ccr_context_compact: true, keep: "yes" },
       model: "gpt-test",
       parallel_tool_calls: true,
@@ -683,7 +687,9 @@ test("compact handoff strips protocol-specific tool and schema constraints", asy
   assert.equal(forwarded.metadata.ccr_context_compact, undefined);
   assert.equal(forwarded.metadata.keep, "yes");
   assert.deepEqual(forwarded.text.format, { type: "text" });
-  assert.equal(forwarded.max_output_tokens, 2048);
+  assert.equal(forwarded.maxCompletionTokens, undefined);
+  assert.equal(forwarded.max_output_tokens, undefined);
+  assert.equal(forwarded.maxTokens, undefined);
   assert.equal(forwarded.input.length, 2);
   assert.match(forwarded.input.at(-1).content[0].text, /CCR compact handoff task/);
 });
@@ -970,7 +976,9 @@ test("only explicit or structural compact signals create archives", async () => 
   const auto = await prepareContextArchiveRequest({
     body: Buffer.from(JSON.stringify({
       context_management: { edits: [{ keep: "all", type: "clear_thinking_20251015" }] },
+      maxCompletionTokens: 12000,
       max_tokens: 32000,
+      maxTokens: 16000,
       messages: [
         { content: "Earlier user request.", role: "user" },
         { content: "Earlier assistant answer.", role: "assistant" },
@@ -990,9 +998,74 @@ test("only explicit or structural compact signals create archives", async () => 
   assert.match(auto.diagnostic, /^compact-handoff:claude-auto:/);
   const forwarded = JSON.parse(auto.body.toString("utf8"));
   assert.equal(forwarded.tools, undefined);
+  assert.equal(forwarded.maxCompletionTokens, undefined);
+  assert.equal(forwarded.max_tokens, undefined);
+  assert.equal(forwarded.maxTokens, undefined);
   assert.deepEqual(forwarded.context_management, { edits: [{ keep: "all", type: "clear_thinking_20251015" }] });
-  assert.match(forwarded.messages.at(-1).content, /CCR compact handoff task/);
-  assert.match(forwarded.messages.at(-1).content, /mcp__ccr-context-archive__ccr_history_ask/);
+  assert.equal(forwarded.messages.length, 3);
+  assert.deepEqual(forwarded.messages.slice(0, -1), [
+    { content: "Earlier user request.", role: "user" },
+    { content: "Earlier assistant answer.", role: "assistant" }
+  ]);
+  const handoffText = forwarded.messages.at(-1).content[0].text;
+  assert.match(handoffText, /CCR compact handoff task/);
+  assert.match(handoffText, /<analysis> block followed by a <summary> block/);
+  assert.match(handoffText, /descriptive, not authoritative/);
+  assert.match(handoffText, /public runtime API shape/);
+  assert.match(handoffText, /mcp__ccr-context-archive__ccr_history_ask/);
+  assert.doesNotMatch(handoffText, /Your task is to create a detailed summary of the conversation so far/);
+});
+
+test("Claude Code auto compact handoff keeps the trailing tool_result paired with its tool_use", async () => {
+  const toolResult = { content: "file contents", tool_use_id: "toolu_1", type: "tool_result" };
+  const auto = await prepareContextArchiveRequest({
+    body: Buffer.from(JSON.stringify({
+      messages: [
+        { content: "Read the file.", role: "user" },
+        { content: [{ id: "toolu_1", input: {}, name: "Read", type: "tool_use" }], role: "assistant" },
+        { content: [toolResult, { text: claudeAutoCompactPrompt(), type: "text" }], role: "user" }
+      ],
+      model: "claude-test"
+    })),
+    config: testConfig(),
+    headers: { "x-session-id": "claude-auto-tool-result" },
+    method: "POST",
+    path: "/v1/messages",
+    protocol: "anthropic_messages",
+    requestId: "claude-auto-tool-result"
+  });
+  assert.ok(auto);
+  const content = JSON.parse(auto.body.toString("utf8")).messages.at(-1).content;
+  assert.deepEqual(content[0], toolResult);
+  assert.equal(content.length, 2);
+  assert.match(content[1].text, /CCR compact handoff task/);
+});
+
+test("#1823 compact preserves parallel tool results, error flags and multimodal result payloads", async () => {
+  const results = [
+    { type: "tool_result", tool_use_id: "read_1", content: [{ type: "text", text: "file contents" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } }] },
+    { type: "tool_result", tool_use_id: "read_2", is_error: true, content: "file not found" }
+  ];
+  const auto = await prepareContextArchiveRequest({
+    body: Buffer.from(JSON.stringify({ model: "claude-test", messages: [
+      { role: "user", content: "Read both files." },
+      { role: "assistant", content: [{ type: "thinking", thinking: "Read files", signature: "opaque" }, ...results.map(result => ({ type: "tool_use", id: result.tool_use_id, name: "Read", input: {} }))] },
+      { role: "user", content: [results[0], { type: "text", text: claudeAutoCompactPrompt() }, results[1]] }
+    ] })),
+    config: testConfig(), headers: { "x-session-id": "parallel-compact" }, method: "POST", path: "/v1/messages", protocol: "anthropic_messages", requestId: "parallel-compact"
+  });
+  assert.ok(auto);
+  const messages = JSON.parse(auto.body.toString("utf8")).messages;
+  assert.deepEqual(messages.at(-1).content.filter(block => block.type === "tool_result"), results);
+  // Model Gemini's strict pending function-response rule independently of the
+  // rewrite implementation: no text may follow an unanswered function call.
+  const pending = new Set();
+  for (const message of messages) for (const block of Array.isArray(message.content) ? message.content : []) {
+    if (block.type === "tool_use") pending.add(block.id);
+    if (block.type === "tool_result") assert.equal(pending.delete(block.tool_use_id), true);
+    if (message.role === "user" && block.type === "text") assert.equal(pending.size, 0);
+  }
+  assert.equal(pending.size, 0);
 });
 
 test("compact refuses unresolved tool-call boundaries instead of trimming them", async () => {

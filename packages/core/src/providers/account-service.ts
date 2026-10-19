@@ -21,6 +21,7 @@ import { getUsageTotalsSince } from "@ccr/core/usage/store";
 import { findProviderPresetByBaseUrl, providerEndpointCanReceiveProviderApiKey } from "@ccr/core/providers/presets/index";
 import { fetchWithSystemProxy } from "@ccr/core/proxy/system-proxy-fetch";
 import { normalizeProviderBaseUrl, providerUrlWithDefaultScheme } from "@ccr/core/providers/url";
+import { fetchProviderAccountWebContentJson } from "@ccr/core/providers/account-webcontent";
 import { isGatewayProviderEnabled } from "@ccr/core/contracts/app";
 import type {
   AppConfig,
@@ -54,6 +55,12 @@ import type {
   ProviderCredentialConfig,
   ProviderAccountStatus
 } from "@ccr/core/contracts/app";
+
+export {
+  setProviderAccountWebContentFetchHandler,
+  type ProviderAccountWebContentFetchHandler,
+  type ProviderAccountWebContentFetchRequest
+} from "@ccr/core/providers/account-webcontent";
 
 type CacheEntry = {
   expiresAt: number;
@@ -95,27 +102,6 @@ type CodexOauthRefreshResult = {
   scope?: string;
 };
 
-export type ProviderAccountWebContentFetchRequest = {
-  body?: unknown;
-  credentials?: ProviderAccountBrowserCredentialsMode;
-  endpoint: string;
-  headers?: Record<string, string>;
-  headerTemplates?: Record<string, string>;
-  loginUrl?: string;
-  method: "GET" | "POST";
-  provider: GatewayProviderConfig;
-  requestOrigin: string;
-  timeoutMs?: number;
-};
-
-export type ProviderAccountWebContentFetchResponse = {
-  payload: unknown;
-};
-
-export type ProviderAccountWebContentFetchHandler = (
-  request: ProviderAccountWebContentFetchRequest
-) => Promise<ProviderAccountWebContentFetchResponse>;
-
 const defaultRefreshIntervalMs = 5 * 60 * 1000;
 const minRefreshIntervalMs = 30 * 1000;
 const maxErrorRefreshIntervalMs = 60 * 1000;
@@ -132,11 +118,6 @@ const cache = new Map<string, CacheEntry>();
 const codexOauthCache = new Map<string, CodexOauthRefreshResult>();
 const inFlightRefreshes = new Map<string, Promise<ProviderAccountSnapshot | undefined>>();
 let cacheGeneration = 0;
-let providerAccountWebContentFetchHandler: ProviderAccountWebContentFetchHandler | undefined;
-
-export function setProviderAccountWebContentFetchHandler(handler: ProviderAccountWebContentFetchHandler | undefined): void {
-  providerAccountWebContentFetchHandler = handler;
-}
 
 export async function getProviderAccountSnapshots(
   providerName?: string,
@@ -832,6 +813,10 @@ async function resolvePluginConnector(
   const result = await pluginConnector.resolve({
     config,
     connector,
+    fetchProviderAccountJson: (request) => fetchProviderAccountWebContentJson({
+      ...request,
+      provider: request.provider ?? provider
+    }),
     now: now.toISOString(),
     provider
   });
@@ -1510,6 +1495,9 @@ async function localAgentProviderAccountCredential(
     if (key.includes("zcode-api-key")) {
       return localApiKeyHeaderAccountCredential(plugin);
     }
+    if (isLocalOpenCodeProvider(provider)) {
+      return localOpenCodeAccountCredential(plugin);
+    }
   }
   if (isLocalCodexProvider(provider)) {
     return await localCodexAccountCredential({
@@ -1568,6 +1556,15 @@ function isLocalZcodeProvider(provider: GatewayProviderConfig): boolean {
     provider.name,
     baseUrl
   ]);
+}
+
+function isLocalOpenCodeProvider(provider: GatewayProviderConfig): boolean {
+  try {
+    const url = new URL(providerUrlWithDefaultScheme(normalizeProviderBaseUrl(providerBaseUrl(provider))));
+    return url.hostname === "opencode.ai" && /^\/zen(?:\/|$)/.test(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 function localZcodeProviderBaseUrlMatches(provider: GatewayProviderConfig, credentialBaseUrl: string): boolean {
@@ -1890,6 +1887,22 @@ function localApiKeyHeaderAccountCredential(plugin: Record<string, unknown>): { 
   };
 }
 
+function localOpenCodeAccountCredential(plugin: Record<string, unknown>): LocalAgentAccountCredential {
+  const headers = localProviderPluginAuthHeaders(plugin);
+  // OpenCode imports auth as a bearer token, an Anthropic x-api-key, or a
+  // Gemini x-goog-api-key depending on the provider protocol. The account
+  // usage endpoint always expects a bearer token, so normalize them here.
+  const apiKey =
+    readBearerToken(headers.authorization || headers.Authorization) ||
+    headers["x-api-key"] ||
+    headers["X-API-Key"] ||
+    headers["x-goog-api-key"];
+  return {
+    apiKey,
+    headers: withoutHeaders(headers, ["authorization", "x-api-key", "x-goog-api-key"])
+  };
+}
+
 function localProviderPluginAuthHeaders(plugin: Record<string, unknown>): Record<string, string> {
   const auth = isRecord(plugin.auth) ? plugin.auth : {};
   const headers = isRecord(auth.headers) ? auth.headers : {};
@@ -1905,6 +1918,11 @@ function withoutHeader(headers: Record<string, string>, header: string): Record<
   return Object.fromEntries(Object.entries(headers).filter(([key]) => key.toLowerCase() !== normalized));
 }
 
+function withoutHeaders(headers: Record<string, string>, names: string[]): Record<string, string> {
+  const normalized = new Set(names.map((name) => name.toLowerCase()));
+  return Object.fromEntries(Object.entries(headers).filter(([key]) => !normalized.has(key.toLowerCase())));
+}
+
 function readBearerToken(value: string | undefined): string | undefined {
   const match = value?.match(/^Bearer\s+(.+)$/i);
   return match?.[1]?.trim() || undefined;
@@ -1914,10 +1932,6 @@ async function fetchWebContentJson(
   provider: GatewayProviderConfig,
   connector: ProviderAccountWebContentJsonConnectorConfig
 ): Promise<unknown> {
-  if (!providerAccountWebContentFetchHandler) {
-    throw new Error("Browser session account requests are only available in CCR Desktop. Use HTTP JSON in CLI or Docker.");
-  }
-
   const endpoint = absoluteAccountEndpoint(provider, connector.endpoint);
   const endpointUrl = parseHttpUrl(endpoint, "Browser session account endpoint");
   const browser = connector.browser ?? {};
@@ -1932,7 +1946,7 @@ async function fetchWebContentJson(
   const requestOrigin = normalizeWebContentRequestOrigin(browser.requestOrigin, loginOrigin ?? endpointUrl.origin);
   const credentials = normalizeWebContentCredentials(browser.credentials, browser.headerTemplates);
 
-  const response = await providerAccountWebContentFetchHandler({
+  return await fetchProviderAccountWebContentJson({
     body: connector.method === "POST" ? connector.body : undefined,
     credentials,
     endpoint: endpointUrl.toString(),
@@ -1944,7 +1958,6 @@ async function fetchWebContentJson(
     requestOrigin,
     timeoutMs: browser.timeoutMs
   });
-  return response.payload;
 }
 
 function providerWithoutApiKey(provider: GatewayProviderConfig): GatewayProviderConfig {

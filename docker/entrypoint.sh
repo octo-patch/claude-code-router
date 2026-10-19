@@ -7,20 +7,20 @@ CCR_WEB_PORT="${CCR_WEB_PORT:-3459}"
 CCR_NGINX_PORT="${CCR_NGINX_PORT:-8080}"
 CCR_GATEWAY_HOST="${CCR_GATEWAY_HOST:-127.0.0.1}"
 CCR_GATEWAY_PORT="${CCR_GATEWAY_PORT:-3456}"
-CCR_GATEWAY_CORE_PORT="${CCR_GATEWAY_CORE_PORT:-3457}"
 CCR_PUBLIC_HOST="${CCR_PUBLIC_HOST:-127.0.0.1}"
 CCR_PUBLIC_PORT="${CCR_PUBLIC_PORT:-3458}"
 CCR_PUBLIC_BASE_URL="${CCR_PUBLIC_BASE_URL:-http://${CCR_PUBLIC_HOST}:${CCR_PUBLIC_PORT}}"
 CCR_NO_GATEWAY="${CCR_NO_GATEWAY:-0}"
 
+CCR_WEB_AUTH_TOKEN_GENERATED=0
 if [ -z "${CCR_WEB_AUTH_TOKEN:-}" ]; then
   CCR_WEB_AUTH_TOKEN="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))")"
+  CCR_WEB_AUTH_TOKEN_GENERATED=1
 fi
 CCR_WEB_AUTH_TOKEN_QUERY="$(node -e "process.stdout.write(encodeURIComponent(process.argv[1] || ''))" "${CCR_WEB_AUTH_TOKEN}")"
 
 export HOME="${CCR_DATA_DIR}"
 export CCR_DATA_DIR
-export CCR_GATEWAY_CORE_PORT
 export CCR_GATEWAY_HOST
 export CCR_GATEWAY_PORT
 export CCR_NGINX_PORT
@@ -48,7 +48,6 @@ const configDir = path.join(process.env.HOME, ".claude-code-router");
 const configFile = path.join(configDir, "config.json");
 const gatewayHost = process.env.CCR_GATEWAY_HOST || "0.0.0.0";
 const gatewayPort = Number(process.env.CCR_GATEWAY_PORT || "3456");
-const gatewayCorePort = Number(process.env.CCR_GATEWAY_CORE_PORT || "3457");
 const publicBaseUrl = (process.env.CCR_PUBLIC_BASE_URL || `http://127.0.0.1:${process.env.CCR_PUBLIC_PORT || "3458"}`).replace(/\/+$/, "");
 
 fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
@@ -56,8 +55,6 @@ fs.writeFileSync(configFile, `${JSON.stringify({
   HOST: gatewayHost,
   PORT: gatewayPort,
   gateway: {
-    coreHost: "127.0.0.1",
-    corePort: gatewayCorePort,
     enabled: true,
     host: gatewayHost,
     port: gatewayPort
@@ -77,7 +74,6 @@ const configFile = path.join(configDir, "config.json");
 const appConfigDbFile = path.join(configDir, "config.sqlite");
 const gatewayHost = process.env.CCR_GATEWAY_HOST || "127.0.0.1";
 const gatewayPort = Number(process.env.CCR_GATEWAY_PORT || "3456");
-const gatewayCorePort = Number(process.env.CCR_GATEWAY_CORE_PORT || "3457");
 const publicBaseUrl = (process.env.CCR_PUBLIC_BASE_URL || `http://127.0.0.1:${process.env.CCR_PUBLIC_PORT || "3458"}`).replace(/\/+$/, "");
 
 function syncConfig(value) {
@@ -86,10 +82,12 @@ function syncConfig(value) {
   }
   value.HOST = gatewayHost;
   value.PORT = gatewayPort;
+  const existingGateway = value.gateway && typeof value.gateway === "object" && !Array.isArray(value.gateway)
+    ? value.gateway
+    : {};
+  const { coreHost: _coreHost, corePort: _corePort, ...publicGateway } = existingGateway;
   value.gateway = {
-    ...(value.gateway && typeof value.gateway === "object" && !Array.isArray(value.gateway) ? value.gateway : {}),
-    coreHost: "127.0.0.1",
-    corePort: gatewayCorePort,
+    ...publicGateway,
     enabled: true,
     host: gatewayHost,
     port: gatewayPort
@@ -145,14 +143,13 @@ server {
 
   client_max_body_size 8m;
 
+  # The management token is never put in a response. A token the user supplies
+  # in the query string is passed on to the page, which reads it from the URL.
   location = / {
-    return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};
+    return 302 /pages/home/index.html\$is_args\$args;
   }
 
   location = /pages/home/index.html {
-    if (\$arg_ccr_web_token = "") {
-      return 302 /pages/home/index.html?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY};
-    }
     try_files /pages/home/index.html =404;
   }
 
@@ -195,6 +192,11 @@ server {
   }
 }
 EOF
+
+# A generated token is only reachable through the container logs.
+if [ "${CCR_WEB_AUTH_TOKEN_GENERATED}" = "1" ]; then
+  echo "CCR management UI: ${CCR_PUBLIC_BASE_URL%/}/?ccr_web_token=${CCR_WEB_AUTH_TOKEN_QUERY}"
+fi
 
 if [ "$#" -gt 0 ]; then
   exec "$@"

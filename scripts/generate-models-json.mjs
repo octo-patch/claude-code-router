@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
+import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -50,6 +52,7 @@ const canonicalModelOverrides = new Map([
 const fetchAttempts = 3;
 const fetchRetryDelayMs = 500;
 const fetchTimeoutMs = 15_000;
+const execFileAsync = promisify(execFile);
 
 const firstPartyProviderAliases = new Map(Object.entries({
   ai21: "ai21",
@@ -117,7 +120,7 @@ async function main() {
   );
   if (failures.length > 0) {
     const existingCatalog = await readExistingCatalog();
-    if (existingCatalog) {
+    if (existingCatalog && !process.argv.includes("--strict")) {
       console.warn(`[models] Refresh failed (${failures.join("; ")}).`);
       console.warn(
         `[models] Keeping the checked-in catalog with ${existingCatalog.models.length} model records.`
@@ -178,9 +181,26 @@ async function fetchJson(url) {
       }
     }
   }
-  throw new Error(
-    `Failed to fetch ${url} after ${fetchAttempts} attempts: ${formatError(lastError)}`
+  try {
+    return await fetchJsonWithCurl(url);
+  } catch (curlError) {
+    throw new Error(
+      `Failed to fetch ${url} after ${fetchAttempts} attempts: ${formatError(lastError)}; curl fallback failed: ${formatError(curlError)}`
+    );
+  }
+}
+
+async function fetchJsonWithCurl(url) {
+  const { stdout } = await execFileAsync(
+    "curl",
+    ["-sL", "--fail", "--max-time", String(Math.ceil(fetchTimeoutMs / 1000)), "-H", "accept: application/json", url],
+    {
+      encoding: "utf8",
+      maxBuffer: 128 * 1024 * 1024,
+      windowsHide: true
+    }
   );
+  return JSON.parse(stdout);
 }
 
 async function readExistingCatalog() {
@@ -1242,7 +1262,7 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-main().catch((error) => {
+await main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

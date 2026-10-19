@@ -1,6 +1,9 @@
-import { loadModelCatalogPayload } from "@ccr/core/models/catalog-file";
+import { loadModelCatalogPayload, modelCatalogRevision, scheduleModelCatalogRefresh } from "@ccr/core/models/catalog-file";
+import type { GatewayProviderConfig } from "@ccr/core/contracts/app";
+import { getProviderCatalogModels } from "@ccr/core/providers/model-catalog";
 
 const claudeCodeDefaultContextTokens = 200_000;
+let catalogRevision = -1;
 let modelCatalogIndex: ModelCatalogIndex | undefined;
 
 export type ModelCatalogCapabilities = Record<string, unknown>;
@@ -72,6 +75,33 @@ export function findModelCatalogEntry(model: string): ModelCatalogEntry | undefi
   }
 
   return fallbackModelCatalogEntry(model);
+}
+
+export function findProviderModelCatalogEntry(
+  provider: Pick<GatewayProviderConfig, "api_base_url" | "baseUrl" | "baseurl" | "name"> | undefined,
+  model: string | undefined,
+  fallbackSelectors: string[] = []
+): ModelCatalogEntry | undefined {
+  const modelName = model?.trim();
+  if (!modelName) {
+    return fallbackSelectors
+      .map((selector) => findModelCatalogEntry(selector))
+      .find((entry): entry is ModelCatalogEntry => entry !== undefined);
+  }
+
+  const providerName = provider?.name?.trim() ?? "";
+  const catalogProvider = provider
+    ? getProviderCatalogModels({ baseUrl: providerBaseUrl(provider), name: provider.name }).provider
+    : undefined;
+  const selectors = uniqueStrings([
+    catalogProvider ? `${catalogProvider}/${modelName}` : "",
+    providerName ? `${providerName}/${modelName}` : "",
+    ...fallbackSelectors,
+    modelName
+  ]);
+  return selectors
+    .map((selector) => findModelCatalogEntry(selector))
+    .find((entry): entry is ModelCatalogEntry => entry !== undefined);
 }
 
 function fallbackModelCatalogEntry(model: string): ModelCatalogEntry | undefined {
@@ -184,6 +214,12 @@ export function modelCatalogReasoningEffortConfig(entry: ModelCatalogEntry | und
 }
 
 function loadModelCatalogIndex(): ModelCatalogIndex {
+  scheduleModelCatalogRefresh();
+  const currentRevision = modelCatalogRevision();
+  if (catalogRevision !== currentRevision) {
+    catalogRevision = currentRevision;
+    modelCatalogIndex = undefined;
+  }
   if (modelCatalogIndex) {
     return modelCatalogIndex;
   }
@@ -317,6 +353,10 @@ function modelCatalogLookupKeys(value: string): string[] {
     ? normalizeModelCatalogKey(raw.replace(/^claude-/i, ""))
     : "";
   return uniqueStrings([normalized, withoutClaudePrefix]);
+}
+
+function providerBaseUrl(provider: Pick<GatewayProviderConfig, "api_base_url" | "baseUrl" | "baseurl">): string {
+  return provider.baseurl || provider.baseUrl || provider.api_base_url || "";
 }
 
 function normalizeModelCatalogKey(value: string): string {
